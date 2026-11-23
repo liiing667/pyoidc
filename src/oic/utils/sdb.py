@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import logging
+import threading
 import uuid
 import warnings
 from binascii import Error
@@ -20,6 +21,11 @@ from oic.utils.time_util import utc_time_sans_frac
 __author__ = "rohe0002"
 
 logger = logging.getLogger(__name__)
+
+# A single lock shared by all SessionDB instances: refresh-token rotation and
+# revocation always have to be serialized, also when several SessionDB objects
+# are backed by the same (shared) session backend.
+_REFRESH_LOCK = threading.RLock()
 
 
 def lv_pack(*args):
@@ -41,6 +47,10 @@ def lv_unpack(txt):
 
 class ExpiredToken(Exception):
     pass
+
+
+class RefreshTokenReuse(ExpiredToken):
+    """Raised when an already rotated refresh token is presented again."""
 
 
 class WrongTokenType(Exception):
@@ -84,6 +94,12 @@ class Token:
             if token_storage is None:
                 raise ImproperlyConfigured("token_storage kwarg must be passed in for refresh token.")
         self.token_storage = token_storage
+        # Per-token state.  This is deliberately kept next to the token factory
+        # and not in the session dictionary: the session represents the whole
+        # lineage, while consumption/revocation must be tracked per token
+        # generation.  ``token_storage`` alone is keyed by ``sid`` and can
+        # therefore not distinguish an old token from its replacement.
+        self._token_meta: dict[str, dict[str, Any]] = {}
 
     def __call__(self, sid, *args, **kwargs):
         """Return a token.
@@ -138,12 +154,78 @@ class Token:
         eat = self.expires_at(token)
         return bool(now > eat)
 
+    def register_token(self, token, sid=None, client_id=None, lineage=None):
+        """Register the state belonging to a concrete token value.
+
+        :param token: The token value
+        :param sid: The session the token belongs to
+        :param client_id: The client the token was issued to
+        :param lineage: Identifier shared by a refresh-token family
+        :return: The metadata dictionary for the token
+        """
+        meta = self._token_meta.setdefault(token, {})
+        if sid is not None:
+            meta["sid"] = sid
+        if client_id is not None:
+            meta["client_id"] = client_id
+        if lineage is not None:
+            meta["lineage"] = lineage
+        meta.setdefault("consumed", False)
+        meta.setdefault("revoked", False)
+        return meta
+
+    def get_token_meta(self, token):
+        """Return per-token state, or ``None`` for unknown/legacy tokens."""
+        return self._token_meta.get(token)
+
+    def get_lineage(self, token):
+        """Return the refresh-token lineage identifier for ``token``."""
+        meta = self._token_meta.get(token)
+        if meta is not None:
+            return meta.get("lineage")
+        return None
+
+    def consume_token(self, token, replaced_by=None):
+        """Mark a token value as consumed by a successful rotation."""
+        meta = self._token_meta.get(token)
+        if meta is None:
+            return None
+        meta["consumed"] = True
+        if replaced_by is not None:
+            meta["replaced_by"] = replaced_by
+        return meta
+
+    def revoke_token_state(self, token):
+        """Mark a single token value as revoked without touching its lineage."""
+        meta = self._token_meta.get(token)
+        if meta is not None:
+            meta["revoked"] = True
+        return meta
+
+    def revoke_lineage(self, lineage):
+        """Revoke every known token value belonging to ``lineage``."""
+        if lineage is None:
+            return []
+        revoked = []
+        for token, meta in list(self._token_meta.items()):
+            if meta.get("lineage") == lineage:
+                meta["revoked"] = True
+                revoked.append(token)
+        return revoked
+
     def invalidate(self, token):
         """Mark the refresh token as invalidated."""
+        meta = self._token_meta.get(token)
+        if meta is not None:
+            meta["revoked"] = True
+            return
         if self.get_type(token) != "R":
             return
         sid = self.get_key(token)
-        self.token_storage[sid]["revoked"] = True
+        try:
+            self.token_storage[sid]["revoked"] = True
+        except (KeyError, TypeError):
+            pass
 
     def valid(self, token):
         try:
@@ -153,7 +235,13 @@ class Token:
         if typ != self.type:
             raise WrongTokenType
         if typ == "R":
-            return not self.token_storage[key].get("revoked", False)
+            meta = self._token_meta.get(token)
+            if meta is not None:
+                return not meta.get("revoked", False) and not meta.get("consumed", False)
+            try:
+                return not self.token_storage[key].get("revoked", False)
+            except (KeyError, TypeError):
+                return False
         else:
             return True
 
@@ -182,11 +270,23 @@ class DefaultToken(Token):
             rnd = rndstr(32)  # Ultimate length multiple of 16
 
         issued_at = "{}".format(utc_time_sans_frac())
+        sinfo = kwargs.get("sinfo") or {}
+        lineage = kwargs.pop("lineage", None)
+        if lineage is None and isinstance(sinfo, dict):
+            lineage = sinfo.get("lineage")
+        client_id = kwargs.pop("client_id", None)
+        if client_id is None and isinstance(sinfo, dict):
+            client_id = sinfo.get("client_id")
+
         if ttype == "R":
             # kwargs["sinfo"] is a dictionary and we do not want updates...
             self.token_storage[sid] = copy.deepcopy(kwargs["sinfo"])
 
-        return base64.b64encode(self.crypt.encrypt(lv_pack(rnd, ttype, sid, issued_at).encode())).decode("utf-8")
+        # Client and lineage are bound into the token itself.  This keeps the
+        # binding available even when the in-memory per-token metadata is lost
+        # (for example after a restart of the process).
+        payload = lv_pack(rnd, ttype, sid, issued_at, str(client_id or ""), str(lineage or ""))
+        return base64.b64encode(self.crypt.encrypt(payload.encode())).decode("utf-8")
 
     def key(self, user="", areq=None, **kwargs):
         """Return a key - the session id - that are based on some session connected data.
@@ -199,16 +299,46 @@ class DefaultToken(Token):
         csum.update(rndstr(32).encode("utf-8"))
         return csum.hexdigest()  # 56 bytes long, 224 bits
 
+    def _split_token_parts(self, token):
+        """Decode a token into the full list of fields."""
+        plain = self.crypt.decrypt(base64.b64decode(token)).decode()
+        # order: rnd, type, sid, iat, client_id, lineage
+        parts = lv_unpack(plain)
+        # Tokens issued before client/lineage binding only contain four fields.
+        while len(parts) < 6:
+            parts.append("")
+        return parts
+
     def _split_token(self, token):
         """Decode the token.
 
         :param token: A token
         :return: Tuple of sid, type, iat, salt
         """
-        plain = self.crypt.decrypt(base64.b64decode(token)).decode()
-        # order: rnd, type, sid, iat
-        p = lv_unpack(plain)
+        p = self._split_token_parts(token)
         return p[1], p[2], int(p[3]), p[0]
+
+    def get_info(self, token):
+        """Return decoded information about ``token``."""
+        p = self._split_token_parts(token)
+        return {
+            "type": p[1],
+            "sid": p[2],
+            "iat": int(p[3]),
+            "rnd": p[0],
+            "client_id": p[4] or None,
+            "lineage": p[5] or None,
+        }
+
+    def get_lineage(self, token):
+        """Return the refresh-token lineage bound into the token."""
+        meta = self._token_meta.get(token)
+        if meta is not None and meta.get("lineage"):
+            return meta["lineage"]
+        try:
+            return self.get_info(token).get("lineage")
+        except Exception:  # nosec
+            return None
 
     def type_and_key(self, token):
         """Return type of Token (A=Access code, T=Token, R=Refresh token) and the session id.
@@ -412,6 +542,10 @@ class SessionDB:
                 stacklevel=2,
             )
         self._db = db
+        # Rotation, reuse detection and revocation of a refresh-token lineage
+        # have to be serialized.  The lock is shared by all SessionDB objects
+        # because they may use the same session backend.
+        self._refresh_lock = _REFRESH_LOCK
 
         self.sm_salt = sm_salt or rndstr(32)
 
@@ -677,18 +811,35 @@ class SessionDB:
                 )
                 dic["refresh_token"] = refresh_token
             elif self.token_factory["refresh_token"] is not None:
-                refresh_token = self.token_factory["refresh_token"](key, sinfo=dic)
+                factory = self.token_factory["refresh_token"]
+                lineage = dic.get("refresh_token_lineage") or self._lineage_for_sid(key)
+                refresh_token = factory(
+                    key,
+                    sinfo=dic,
+                    lineage=lineage,
+                    client_id=dic.get("client_id"),
+                )
+                factory.register_token(
+                    refresh_token,
+                    sid=key,
+                    client_id=dic.get("client_id"),
+                    lineage=lineage,
+                )
                 dic["refresh_token"] = refresh_token
         self._db[key] = dic
         return dic
 
     def refresh_token(self, rtoken, client_id):  # noqa: C901 # was 16
-        """Issue a new access token using a valid refresh token.
+        """Rotate a refresh token and issue a new access token.
+
+        The presented token is consumed and replaced by a new token in the same
+        lineage.  Reusing an already consumed token revokes the complete
+        lineage.
 
         :param rtoken: Refresh token
         :param client_id: Client ID
         :return: Dictionary with session info
-        :raises: ExpiredToken for invalid refresh token
+        :raises: ExpiredToken for invalid, expired or reused refresh token
                  WrongTokenType for wrong token type
         """
         # assert that it is a refresh token and that it is valid
@@ -716,40 +867,256 @@ class SessionDB:
                     pass
                 else:
                     if at:
-                        self.access_token.invalidate(at)
+                        self._invalidate_access_token(at)
             else:
                 raise ExpiredToken
-        elif self.token_factory["refresh_token"] is None:
-            raise WrongTokenType
-        elif self.token_factory["refresh_token"].valid(rtoken):
-            if self.token_factory["refresh_token"].is_expired(rtoken):
-                raise ExpiredToken
-            sid = self.token_factory["refresh_token"].get_key(rtoken)
-            try:
-                dic = self._db[sid]
-            except KeyError:
-                # Session is cleared, use the storage in token factory
-                dic = self.token_factory["refresh_token"].token_storage[sid]
-            access_token = self.access_token(sid=sid, sinfo=dic)
-
-            try:
-                at = dic["access_token"]
-            except KeyError:
-                pass
-            else:
-                if at:
-                    self.access_token.invalidate(at)
-
             dic["access_token"] = access_token
-        else:
-            raise ExpiredToken
+            dic["token_type"] = "Bearer"  # nosec
+            dic["refresh_token"] = rtoken
+            dic["revoked"] = False
+            self._db[sid] = dic
+            return dic
 
-        dic["access_token"] = access_token
-        dic["token_type"] = "Bearer"  # nosec
-        dic["refresh_token"] = rtoken
-        dic["revoked"] = False
+        factory = self.token_factory["refresh_token"]
+        if factory is None:
+            raise WrongTokenType
+
+        with self._refresh_lock:
+            meta = factory.get_token_meta(rtoken)
+
+            # An explicitly revoked token stays rejected.  This is deliberately
+            # checked before reuse detection: revoking a token is not a signal
+            # that its whole lineage has to be destroyed.
+            if meta is not None and meta.get("revoked"):
+                raise ExpiredToken
+
+            try:
+                typ, sid = factory.type_and_key(rtoken)
+            except KeyError:
+                # JWT factories keep a jti -> sid mapping.  A token that is
+                # valid but not present in this factory (for example an access
+                # token) is rejected like an expired refresh token, matching
+                # the historical behaviour.
+                if meta is not None and meta.get("consumed"):
+                    self._revoke_refresh_lineage(factory, meta.get("lineage"), meta.get("sid"))
+                raise RefreshTokenReuse from None
+            except Exception:
+                # A consumed token may already have been removed by the token
+                # factory (JWT based factories do that in invalidate()).
+                if meta is not None and meta.get("consumed"):
+                    self._revoke_refresh_lineage(factory, meta.get("lineage"), meta.get("sid"))
+                    raise RefreshTokenReuse from None
+                raise WrongTokenType from None
+
+            if typ != factory.type:
+                raise WrongTokenType
+
+            # Expired tokens keep their historical behaviour (a plain
+            # ExpiredToken, no lineage revocation).
+            if factory.is_expired(rtoken):
+                raise ExpiredToken
+
+            if meta is not None:
+                bound_client = meta.get("client_id")
+                if bound_client is not None and bound_client != client_id:
+                    raise ExpiredToken
+
+            dic = self._refresh_session_info(factory, sid)
+
+            bound_client = dic.get("client_id")
+            if bound_client is not None and bound_client != client_id:
+                raise ExpiredToken
+
+            # The session always records the most recently issued refresh
+            # token.  Comparing the presented value against it also works when
+            # the per-process token metadata is not available (for example
+            # when several frontends share one session backend).
+            current_rt = dic.get("refresh_token")
+            if current_rt and current_rt != rtoken:
+                lineage = meta.get("lineage") if meta is not None else None
+                if lineage is None:
+                    lineage = factory.get_lineage(rtoken)
+                self._revoke_refresh_lineage(factory, lineage, sid)
+                raise RefreshTokenReuse
+
+            # Reuse of a token that was already rotated means that one of the
+            # two parties (the legitimate client or an attacker) is using an
+            # old generation.  Revoke the complete lineage, including the
+            # currently valid generation and its access token.
+            if meta is not None and meta.get("consumed"):
+                self._revoke_refresh_lineage(factory, meta.get("lineage"), sid)
+                raise RefreshTokenReuse
+
+            lineage = None
+            if meta is not None:
+                lineage = meta.get("lineage")
+            if lineage is None:
+                lineage = factory.get_lineage(rtoken)
+            if lineage is None:
+                lineage = dic.get("refresh_token_lineage") or self._lineage_for_sid(sid)
+
+            if meta is None:
+                meta = factory.register_token(
+                    rtoken,
+                    sid=sid,
+                    client_id=bound_client,
+                    lineage=lineage,
+                )
+            else:
+                meta["lineage"] = lineage
+                meta.setdefault("sid", sid)
+                meta.setdefault("client_id", bound_client)
+
+            old_at = dic.get("access_token")
+            new_at = self.access_token(sid=sid, sinfo=dic)
+
+            # Work on a copy of the session so that nothing is visible in the
+            # backend until the rotation is ready to be committed as a whole.
+            new_dic = dict(dic)
+            new_dic["access_token"] = new_at
+            new_dic["token_type"] = "Bearer"  # nosec
+            new_dic["revoked"] = False
+
+            storage = getattr(factory, "token_storage", None)
+            old_storage_entry = None
+            if isinstance(storage, dict) and sid in storage:
+                old_storage_entry = copy.deepcopy(storage[sid])
+
+            try:
+                new_rt = factory(
+                    sid,
+                    sinfo=new_dic,
+                    lineage=lineage,
+                    client_id=bound_client,
+                )
+            except Exception:
+                if isinstance(storage, dict):
+                    if old_storage_entry is None:
+                        storage.pop(sid, None)
+                    else:
+                        storage[sid] = old_storage_entry
+                if new_at != old_at:
+                    self._invalidate_access_token(new_at)
+                raise
+
+            new_dic["refresh_token"] = new_rt
+            factory.register_token(
+                new_rt,
+                sid=sid,
+                client_id=bound_client,
+                lineage=lineage,
+            )
+
+            # Consuming the old generation and issuing the new one is a single
+            # logical commit.  If the session backend rejects the write, roll
+            # the token state back so that the old generation remains usable.
+            old_meta = dict(meta)
+            factory.consume_token(rtoken, replaced_by=new_rt)
+            try:
+                self._db[sid] = new_dic
+            except Exception:
+                meta.clear()
+                meta.update(old_meta)
+                factory.revoke_token_state(new_rt)
+                try:
+                    factory.invalidate(new_rt)
+                except Exception:  # nosec
+                    pass
+                if isinstance(storage, dict):
+                    if old_storage_entry is None:
+                        storage.pop(sid, None)
+                    else:
+                        storage[sid] = old_storage_entry
+                if new_at != old_at:
+                    self._invalidate_access_token(new_at)
+                raise
+
+            self._sync_refresh_factory_storage(factory, sid, new_dic)
+            if old_at and old_at != new_at:
+                self._invalidate_access_token(old_at)
+            return new_dic
+
+    @staticmethod
+    def _lineage_for_sid(sid):
+        """Return the deterministic refresh-token lineage for a session."""
+        return hashlib.sha256("refresh-token-lineage:{}".format(sid).encode("utf-8")).hexdigest()
+
+    def _invalidate_access_token(self, token):
+        """Invalidate an access token if the configured factory supports it."""
+        if not token:
+            return
+        invalidate = getattr(self.access_token, "invalidate", None)
+        if invalidate is not None:
+            invalidate(token)
+
+    def _refresh_session_info(self, factory, sid):
+        """Return a copy of the session information for refresh handling."""
+        try:
+            return dict(self._db[sid])
+        except KeyError:
+            # Session is cleared, use the storage in the token factory.
+            storage = getattr(factory, "token_storage", None) or {}
+            try:
+                return dict(storage[sid])
+            except KeyError:
+                raise ExpiredToken from None
+
+    def _sync_refresh_factory_storage(self, factory, sid, dic):
+        """Keep the opaque token factory's session copy in sync."""
+        storage = getattr(factory, "token_storage", None)
+        if isinstance(storage, dict) and isinstance(storage.get(sid), dict):
+            storage[sid].update(dict(dic))
+
+    def _revoke_refresh_lineage(self, factory, lineage, sid=None):
+        """Revoke all known generations of a refresh-token lineage."""
+        if lineage is None and sid is not None:
+            lineage = self._lineage_for_sid(sid)
+        if sid is None:
+            return factory.revoke_lineage(lineage)
+
+        try:
+            dic = dict(self._db[sid])
+        except KeyError:
+            storage = getattr(factory, "token_storage", None) or {}
+            try:
+                dic = dict(storage[sid])
+            except KeyError:
+                return factory.revoke_lineage(lineage)
+
+        current_rt = dic.get("refresh_token")
+        if current_rt:
+            if lineage is not None and factory.get_token_meta(current_rt) is None:
+                # The current generation may have been issued by another
+                # process that shares the session backend.
+                factory.register_token(
+                    current_rt,
+                    sid=sid,
+                    client_id=dic.get("client_id"),
+                    lineage=lineage,
+                )
+            factory.revoke_token_state(current_rt)
+
+        current_at = dic.get("access_token")
+        if current_at:
+            self._invalidate_access_token(current_at)
+
+        revoked = factory.revoke_lineage(lineage)
+        if current_rt and current_rt not in revoked:
+            revoked.append(current_rt)
+
+        dic["revoked"] = True
         self._db[sid] = dic
-        return dic
+        self._sync_refresh_factory_storage(factory, sid, dic)
+        return revoked
+
+    def get_refresh_token_lineage(self, rtoken):
+        """Return the lineage identifier bound to a refresh token."""
+        if self._refresh_db:
+            return None
+        factory = self.token_factory["refresh_token"]
+        if factory is None:
+            return None
+        return factory.get_lineage(rtoken)
 
     def is_valid(self, token, client_id=None):
         """Check validity of the given token.
@@ -770,15 +1137,15 @@ class SessionDB:
         if self.is_revoked(sid):
             return False
 
-        _dic = self._db[sid]
-
         if typ == "A":
+            _dic = self._db[sid]
             if _dic["code"] != token:
                 return False
             elif _dic["oauth_state"] != "authz":
                 return False
 
         elif typ == "T":
+            _dic = self._db[sid]
             if _dic["access_token"] != token:
                 return False
 
@@ -786,10 +1153,38 @@ class SessionDB:
                 return False
 
         elif typ == "R":
-            if self.token_factory["refresh_token"] is None:
+            factory = self.token_factory["refresh_token"]
+            if factory is None:
                 return False
-            if not self.token_factory["refresh_token"].valid(token):
+
+            meta = factory.get_token_meta(token)
+            if meta is not None:
+                if client_id is not None and meta.get("client_id") is not None and meta["client_id"] != client_id:
+                    return False
+                if meta.get("consumed", False) or meta.get("revoked", False):
+                    return False
+
+            if client_id is not None:
+                try:
+                    session = self._db[sid]
+                except KeyError:
+                    session = None
+                if session is not None and session.get("client_id") not in (None, client_id):
+                    return False
+
+            if factory.is_expired(token):
                 return False
+            if factory.valid(token):
+                return True
+
+            # With opaque tokens the factory may not know the token after a
+            # restart (its in-memory storage was recreated).  The session is
+            # authoritative in that case.
+            try:
+                session = self._db[sid]
+            except KeyError:
+                return False
+            return session.get("refresh_token") == token and not session.get("revoked", False)
         return True
 
     def is_revoked(self, sid):
@@ -832,7 +1227,12 @@ class SessionDB:
         except KeyError:
             pass
         else:
-            self.revoke_refresh_token(rtoken)
+            factory = self.token_factory.get("refresh_token")
+            meta = factory.get_token_meta(rtoken) if factory is not None else None
+            if factory is not None and meta is not None and meta.get("lineage"):
+                self._revoke_refresh_lineage(factory, meta["lineage"], sid)
+            else:
+                self.revoke_refresh_token(rtoken)
 
         self.revoke_token(token)
         return True

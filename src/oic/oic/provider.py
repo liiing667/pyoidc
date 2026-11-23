@@ -55,7 +55,7 @@ from oic.utils.http_util import (
 from oic.utils.jwt import JWT
 from oic.utils.keyio import KEYS, KeyBundle, KeyJar, dump_jwks, key_export
 from oic.utils.sanitize import sanitize
-from oic.utils.sdb import AccessCodeUsed, ExpiredToken, WrongTokenType, session_get
+from oic.utils.sdb import AccessCodeUsed, ExpiredToken, RefreshTokenReuse, WrongTokenType, session_get
 from oic.utils.session_backend import AuthnEvent
 from oic.utils.settings import OicProviderSettings, PyoidcSettings
 from oic.utils.template_render import render_template
@@ -989,6 +989,8 @@ class Provider(AProvider):
         rtoken = areq["refresh_token"]
         try:
             _info = _sdb.refresh_token(rtoken, client_id=client_id)
+        except RefreshTokenReuse:
+            return error_response("invalid_grant", descr="Refresh token has already been used")
         except ExpiredToken:
             return error_response("invalid_request", descr="Refresh token is expired")
         except WrongTokenType:

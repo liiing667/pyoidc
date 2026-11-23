@@ -147,6 +147,9 @@ class JWTToken(Token, JWT):
         return self.type
 
     def invalidate(self, token):
+        meta = self._token_meta.get(token)
+        if meta is not None:
+            meta["revoked"] = True
         info = self.unpack(token)
         try:
             del self.db[info["jti"]]
@@ -167,11 +170,23 @@ class JWTToken(Token, JWT):
         return info["exp"]
 
     def valid(self, token):
+        meta = self._token_meta.get(token)
+        if meta is not None and (meta.get("revoked", False) or meta.get("consumed", False)):
+            return False
         info = self.unpack(token)
         return self.is_valid(info)
 
     def get_info(self, token):
         return self.unpack(token)
+
+    def get_lineage(self, token):
+        meta = self._token_meta.get(token)
+        if meta is not None and meta.get("lineage"):
+            return meta["lineage"]
+        try:
+            return self.unpack(token).get("lineage")
+        except Exception:  # nosec
+            return None
 
 
 class Authorization_Grant(JWTToken):
