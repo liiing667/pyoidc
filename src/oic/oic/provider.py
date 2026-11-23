@@ -949,8 +949,8 @@ class Provider(AProvider):
             _tinfo = _sdb.upgrade_to_token(_access_code, issue_refresh=issue_refresh)
         except AccessCodeUsed as err:
             logger.error("%s", err)
-            # Should revoke the token issued to this access code
-            _sdb.revoke_all_tokens(_access_code)
+            # SessionDB consumed the code and revoked any tokens issued for
+            # it atomically.
             return error_response("access_denied", descr="Access Code already used")
 
         if "openid" in _info["scope"]:

@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import logging
+import threading
 import uuid
 import warnings
 from binascii import Error
@@ -412,6 +413,11 @@ class SessionDB:
                 stacklevel=2,
             )
         self._db = db
+        # Serialize authorization code redemption.  Consuming a code and
+        # issuing tokens for it must happen as a single atomic operation,
+        # otherwise two concurrent requests can both observe an unused code
+        # and each receive a token.
+        self._lock = threading.RLock()
 
         self.sm_salt = sm_salt or rndstr(32)
 
@@ -630,57 +636,67 @@ class SessionDB:
         :param key: The session key. One of token or key must be given.
         :return: The session information as a dictionary
         """
-        if token:
-            try:
-                (_, key) = self.token_factory["code"].type_and_key(token)
-            except Exception:
-                raise WrongTokenType("Not a grant token") from None
+        with self._lock:
+            if token:
+                try:
+                    (_, key) = self.token_factory["code"].type_and_key(token)
+                except Exception:
+                    raise WrongTokenType("Not a grant token") from None
 
-            dic = self._db[key]
+                dic = self._db[key]
 
-            if dic["code_used"]:
-                raise AccessCodeUsed
-            _at = self.access_token(sid=key, sinfo=dic)
-            dic["code_used"] = True
-        else:
-            dic = self._db[key]
-            _at = self.access_token(sid=key, sinfo=dic)
-
-        dic["access_token"] = _at
-        dic["access_token_scope"] = "?"  # nosec
-        dic["oauth_state"] = "token"
-        dic["token_type"] = "Bearer"  # nosec
-
-        if id_token:
-            dic["id_token"] = id_token
-        if oidreq:
-            dic["oidreq"] = oidreq
-
-        if issue_refresh:
-            if "authn_event" in dic:
-                authn_event = AuthnEvent.from_json(dic["authn_event"])
+                if dic["code_used"]:
+                    # Reusing a consumed code is not just an error: any
+                    # tokens already issued for it must be revoked.  Do this
+                    # while still holding the lock so that a concurrent
+                    # redemption cannot slip in between the check and the
+                    # revocation.
+                    self.revoke_all_tokens(token)
+                    raise AccessCodeUsed
+                # Consume the code before issuing anything, so that a second
+                # request can never observe it as unused.
+                dic["code_used"] = True
+                self._db[key] = dic
+                _at = self.access_token(sid=key, sinfo=dic)
             else:
-                authn_event = None
-            if authn_event:
-                uid = authn_event.uid
-            else:
-                uid = None
+                dic = self._db[key]
+                _at = self.access_token(sid=key, sinfo=dic)
 
-            if self._refresh_db:
-                refresh_token = self._refresh_db.create_token(
-                    dic["client_id"],
-                    uid,
-                    dic.get("scope"),
-                    dic["sub"],
-                    dic["authzreq"],
-                    key,
-                )
-                dic["refresh_token"] = refresh_token
-            elif self.token_factory["refresh_token"] is not None:
-                refresh_token = self.token_factory["refresh_token"](key, sinfo=dic)
-                dic["refresh_token"] = refresh_token
-        self._db[key] = dic
-        return dic
+            dic["access_token"] = _at
+            dic["access_token_scope"] = "?"  # nosec
+            dic["oauth_state"] = "token"
+            dic["token_type"] = "Bearer"  # nosec
+
+            if id_token:
+                dic["id_token"] = id_token
+            if oidreq:
+                dic["oidreq"] = oidreq
+
+            if issue_refresh:
+                if "authn_event" in dic:
+                    authn_event = AuthnEvent.from_json(dic["authn_event"])
+                else:
+                    authn_event = None
+                if authn_event:
+                    uid = authn_event.uid
+                else:
+                    uid = None
+
+                if self._refresh_db:
+                    refresh_token = self._refresh_db.create_token(
+                        dic["client_id"],
+                        uid,
+                        dic.get("scope"),
+                        dic["sub"],
+                        dic["authzreq"],
+                        key,
+                    )
+                    dic["refresh_token"] = refresh_token
+                elif self.token_factory["refresh_token"] is not None:
+                    refresh_token = self.token_factory["refresh_token"](key, sinfo=dic)
+                    dic["refresh_token"] = refresh_token
+            self._db[key] = dic
+            return dic
 
     def refresh_token(self, rtoken, client_id):  # noqa: C901 # was 16
         """Issue a new access token using a valid refresh token.
