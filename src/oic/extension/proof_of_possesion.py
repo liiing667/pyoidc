@@ -12,6 +12,7 @@ from oic.oauth2 import error_response
 from oic.oic.message import AccessTokenRequest, AccessTokenResponse
 from oic.oic.provider import Provider
 from oic.utils.http_util import Response, get_post
+from oic.utils.keyio import verify_with_keys
 
 __author__ = "regu0004"
 
@@ -77,7 +78,7 @@ class PoPProvider(Provider):
     def _get_client_public_key(self, access_token):
         _jws = jws.factory(access_token)
         if _jws:
-            data = _jws.verify_compact(access_token, self.keyjar.get_verify_key(owner=""))
+            data = verify_with_keys(_jws, access_token, self.keyjar.get_verify_key(owner=""))
             try:
                 return keyrep(data["cnf"]["jwk"])
             except KeyError as err:

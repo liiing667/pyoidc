@@ -6,6 +6,7 @@ from jwkest.jwe import JWE
 from jwkest.jws import NoSuitableSigningKeys
 
 from oic.oic.message import JasonWebToken
+from oic.utils.keyio import update_keyjar, verify_with_keys
 from oic.utils.time_util import utc_time_sans_frac
 
 __author__ = "roland"
@@ -100,8 +101,20 @@ class JWT:
         else:
             owner = _msg["iss"]
 
-        keys = self.keyjar.get_verify_key(jws.alg2keytype(rj.jwt.headers["alg"]), owner=owner)
-        return rj.verify_compact(token, keys)
+        key_type = jws.alg2keytype(rj.jwt.headers["alg"])
+        keys = self.keyjar.get_verify_key(key_type, owner=owner)
+        try:
+            return verify_with_keys(rj, token, keys)
+        except Exception as err:
+            # A kid may have been reused by a newly rotated key.  Refresh and
+            # retry against a fresh snapshot rather than reusing the stale
+            # candidate list.
+            try:
+                update_keyjar(self.keyjar)
+            except Exception:
+                raise err from None
+            keys = self.keyjar.get_verify_key(key_type, owner=owner)
+            return verify_with_keys(rj, token, keys)
 
     def _decrypt(self, rj, token):
         keys = self.keyjar.get_verify_key(owner="")

@@ -11,12 +11,12 @@ from urllib.parse import parse_qs, urlencode
 from jwkest import as_unicode, b64d, jwe, jws
 from jwkest.jwe import JWE
 from jwkest.jwk import keyitems2keyreps
-from jwkest.jws import JWS, NoSuitableSigningKeys, alg2keytype
+from jwkest.jws import JWS, alg2keytype
 from jwkest.jwt import JWT
 
 from oic.exception import MessageException, PyoidcError
 from oic.oauth2.exception import VerificationError
-from oic.utils.keyio import key_summary, update_keyjar
+from oic.utils.keyio import key_summary, update_keyjar, verify_with_keys
 from oic.utils.sanitize import sanitize
 
 logger = logging.getLogger(__name__)
@@ -457,9 +457,12 @@ class Message(MutableMapping):
         logger.debug("Key set summary for %s: %s", issuer, key_summary(keyjar, issuer))
 
         if kid:
-            _key = keyjar.get_key_by_kid(kid, issuer)
-            if _key and _key not in key:
-                key.append(_key)
+            found = False
+            for _key in keyjar.get_keys_by_kid(kid, issuer):
+                if _key not in key:
+                    key.append(_key)
+                found = True
+            if found:
                 return
         else:
             try:
@@ -517,9 +520,11 @@ class Message(MutableMapping):
             if _kid:
                 jwt["kid"] = _kid
                 try:
-                    _key = keyjar.get_key_by_kid(_kid, _iss)
-                    if _key:
-                        key.append(_key)
+                    _keys = keyjar.get_keys_by_kid(_kid, _iss)
+                    if _keys:
+                        for _key in _keys:
+                            if _key not in key:
+                                key.append(_key)
                         return key
                 except KeyError:
                     pass
@@ -627,12 +632,23 @@ class Message(MutableMapping):
 
                     logger.debug("Found signing key.")
                     try:
-                        _jw.verify_compact(txt, key)
-                    except NoSuitableSigningKeys:
-                        if keyjar:
+                        verify_with_keys(_jw, txt, key)
+                    except Exception as err:
+                        if not keyjar:
+                            raise
+                        # The kid may be known but reused for a new key.  In
+                        # that case no refresh was triggered while selecting
+                        # the key.  Refresh once and verify against a fresh
+                        # snapshot instead of mixing old and new keys.
+                        try:
                             update_keyjar(keyjar)
-                            key = self.get_verify_keys(keyjar, key, jso, _header, _jw, **kwargs)
-                            _jw.verify_compact(txt, key)
+                        except Exception:
+                            raise err from None
+                        fresh_keys = keyjar.get_verify_key(owner="")
+                        if "sender" in kwargs:
+                            fresh_keys.extend(keyjar.get_verify_key(owner=kwargs["sender"]))
+                        key = self.get_verify_keys(keyjar, fresh_keys, jso, _header, _jw, **kwargs)
+                        verify_with_keys(_jw, txt, key)
             except Exception:
                 raise
             else:

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from typing import Any, TypeAlias
 from urllib.parse import urlsplit
@@ -13,6 +14,7 @@ from Cryptodome.PublicKey import RSA
 from jwkest import as_bytes, as_unicode, b64e, jwe, jws
 from jwkest.ecc import NISTEllipticCurve
 from jwkest.jwk import ECKey, JWKException, RSAKey, SYMKey, rsa_load
+from jwkest.jws import NoSuitableSigningKeys
 
 from oic.exception import MessageException, PyoidcError
 
@@ -75,6 +77,8 @@ class KeyBundle:
             ``requests`` documentation.
         """
         self._keys: list[KEYS] = []
+        self._lock = threading.RLock()
+        self._generation = 0
         self.remote = False
         self.verify_ssl = verify_ssl
         self.cache_time = cache_time
@@ -111,58 +115,123 @@ class KeyBundle:
                 elif self.fileformat == "der":  # Only valid for RSA keys
                     self.do_local_der(self.source, self.keytype, self.keyusage)
 
+    def _key_from_jwk(self, inst):
+        """Create a key object from a JWK description.
+
+        The method returns ``None`` for keys of an unknown type.  It never
+        touches the key bundle, which makes it suitable for building a new
+        key set before it is committed.
+        """
+        if not isinstance(inst, dict):
+            raise JWKSError("Illegal JWK")
+
+        try:
+            typ = inst["kty"]
+        except KeyError as err:
+            raise JWKSError("Illegal JWK") from err
+        if not isinstance(typ, str):
+            raise JWKSError("Illegal JWK")
+
+        for _typ in [typ, typ.lower(), typ.upper()]:
+            try:
+                key_cls = K2C[_typ]
+                _key = key_cls(**inst)
+            except KeyError:
+                continue
+            except (TypeError, ValueError):
+                raise JWKSError("Inappropriate JWKS argument type") from None
+            except JWKException as err:
+                logger.warning("Loading a key failed: %s", err)
+                return None
+            else:
+                return _key
+
+        logger.warning("Unknown key type: %s", typ)
+        return None
+
+    def _keys_from_jwks(self, keys):
+        """Convert a list of JWK descriptions to key objects.
+
+        Conversion is done in one go so a malformed JWKS cannot leave a
+        partially updated key bundle behind.
+        """
+        new_keys: list[KEYS] = []
+        for inst in keys:
+            _key = self._key_from_jwk(inst)
+            if _key is not None and _key not in new_keys:
+                new_keys.append(_key)
+        return new_keys
+
+    def _merge_keys(self, keys):
+        """Add keys to the current set and commit them atomically."""
+        with self._lock:
+            merged = list(self._keys)
+            changed = False
+            for key in keys:
+                if key not in merged:
+                    merged.append(key)
+                    changed = True
+            if changed:
+                self._keys = merged
+                self._generation += 1
+            return changed
+
+    def _replace_keys(self, keys):
+        """Replace the current set of keys atomically."""
+        with self._lock:
+            self._keys = list(keys)
+            self._generation += 1
+
+    def _snapshot(self):
+        """Return the currently committed keys."""
+        with self._lock:
+            return list(self._keys)
+
     def do_keys(self, keys):
         """Go from JWK description to binary keys.
 
         :param keys:
         :return:
         """
-        for inst in keys:
-            if not isinstance(inst, dict):
-                raise JWKSError("Illegal JWK")
+        new_keys = self._keys_from_jwks(keys)
+        if new_keys:
+            self._merge_keys(new_keys)
 
-            typ = inst["kty"]
-            flag = 0
-            for _typ in [typ, typ.lower(), typ.upper()]:
-                try:
-                    _key = K2C[_typ](**inst)
-                except KeyError:
-                    continue
-                except TypeError:
-                    raise JWKSError("Inappropriate JWKS argument type") from None
-                except JWKException as err:
-                    logger.warning("Loading a key failed: %s", err)
-                else:
-                    if _key not in self._keys:
-                        self._keys.append(_key)
-                        flag = 1
-                        break
-            if not flag:
-                logger.warning("Unknown key type: %s", typ)
-
-    def do_local_jwk(self, filename):
+    def do_local_jwk(self, filename, replace=False):
         try:
             with open(filename) as f:
-                self.do_keys(json.loads(f.read())["keys"])
-        except KeyError:
+                keys = json.loads(f.read())["keys"]
+        except (KeyError, OSError, TypeError, ValueError):
             logger.error("Now 'keys' keyword in JWKS")
             raise_exception(UpdateFailed, "Local key update from '{}' failed.".format(filename))
+
+        new_keys = self._keys_from_jwks(keys)
+        if replace:
+            self._replace_keys(new_keys)
         else:
+            self._merge_keys(new_keys)
+        with self._lock:
             self.last_updated = time.time()
 
-    def do_local_der(self, filename, keytype, keyusage):
+    def do_local_der(self, filename, keytype, keyusage, replace=False):
         # This is only for RSA keys
         _bkey = rsa_load(filename)
 
         if not keyusage:
             keyusage = ["enc", "sig"]
 
+        new_keys: list[KEYS] = []
         for use in keyusage:
             _key = RSAKey().load_key(_bkey)
             _key.use = use
-            self._keys.append(_key)
+            new_keys.append(_key)
 
-        self.last_updated = time.time()
+        if replace:
+            self._replace_keys(new_keys)
+        else:
+            self._merge_keys(new_keys)
+        with self._lock:
+            self.last_updated = time.time()
 
     def do_remote(self):
         if self.source is None:
@@ -180,37 +249,80 @@ class KeyBundle:
             raise_exception(UpdateFailed, REMOTE_FAILED.format(self.source, str(err)))
 
         if r.status_code == 304:  # file has not changed
-            self.time_out = time.time() + self.cache_time
-            self.last_updated = time.time()
             try:
-                self.do_keys(self.imp_jwks["keys"])
-            except KeyError:
+                keys = self.imp_jwks["keys"]
+            except (KeyError, TypeError):
                 logger.error("No 'keys' keyword in JWKS")
                 raise_exception(UpdateFailed, "No 'keys' keyword in JWKS")
-            else:
-                return False
-        elif r.status_code == 200:  # New content
-            self.time_out = time.time() + self.cache_time
 
-            self.imp_jwks = self._parse_remote_response(r)
-            if not isinstance(self.imp_jwks, dict) or "keys" not in self.imp_jwks:
+            # Validate the cached JWKS before committing the new cache
+            # lifetime.  If anything is wrong the old state stays untouched.
+            try:
+                new_keys = self._keys_from_jwks(keys)
+            except (JWKSError, TypeError, ValueError):
+                logger.error("Malformed cached JWKS")
+                raise_exception(UpdateFailed, MALFORMED.format(self.source))
+            now = time.time()
+            self._commit_remote(
+                new_keys,
+                self.imp_jwks,
+                self.etag,
+                now + self.cache_time,
+                now,
+            )
+            return False
+        elif r.status_code == 200:  # New content
+            imp_jwks = self._parse_remote_response(r)
+            if not isinstance(imp_jwks, dict) or "keys" not in imp_jwks:
                 raise_exception(UpdateFailed, MALFORMED.format(self.source))
 
             logger.debug("Loaded JWKS: %s from %s", r.text, self.source)
             try:
-                self.do_keys(self.imp_jwks["keys"])
-            except KeyError:
+                keys = imp_jwks["keys"]
+            except (KeyError, TypeError):
                 logger.error("No 'keys' keyword in JWKS")
                 raise_exception(UpdateFailed, MALFORMED.format(self.source))
 
             try:
-                self.etag = r.headers["Etag"]
-            except KeyError:
-                pass
+                new_keys = self._keys_from_jwks(keys)
+            except (JWKSError, TypeError, ValueError):
+                logger.error("Malformed JWKS")
+                raise_exception(UpdateFailed, MALFORMED.format(self.source))
+            now = time.time()
+            self._commit_remote(
+                new_keys,
+                imp_jwks,
+                r.headers.get("Etag", ""),
+                now + self.cache_time,
+                now,
+            )
         else:
             raise_exception(UpdateFailed, REMOTE_FAILED.format(self.source, r.status_code))
-        self.last_updated = time.time()
         return True
+
+    def _commit_remote(self, keys, imp_jwks, etag, time_out, last_updated):
+        """Commit freshly fetched keys and their cache metadata together.
+
+        Keys are merged, not replaced, so keys that are still present in a
+        rotated JWKS (and keys kept for tokens that are still valid) continue
+        to work.  The whole state is swapped under one lock so another caller
+        can only observe the old or the new generation.
+        """
+        with self._lock:
+            merged = list(self._keys)
+            changed = False
+            for key in keys:
+                if key not in merged:
+                    merged.append(key)
+                    changed = True
+            if changed:
+                self._keys = merged
+                self._generation += 1
+
+            self.imp_jwks = imp_jwks
+            self.etag = etag
+            self.time_out = time_out
+            self.last_updated = last_updated
 
     def _parse_remote_response(self, response):
         """Parse JWKS from the HTTP response.
@@ -235,14 +347,18 @@ class KeyBundle:
 
     def _uptodate(self):
         res = False
-        if self._keys != []:
-            if self.remote:  # verify that it's not to old
-                if time.time() > self.time_out:
-                    if self.update():
-                        res = True
-        elif self.remote:
-            if self.update():
-                res = True
+        if self.remote and (not self._keys or time.time() > self.time_out):
+            try:
+                if self.update():
+                    res = True
+            except UpdateFailed as err:
+                # Keep serving the last complete key set.  A failed refresh
+                # must not make keys that were valid before the refresh
+                # disappear.  The cache remains expired, so a later call will
+                # retry the remote update.
+                if not self._keys:
+                    raise
+                logger.warning("Key update failed, keeping cached keys: %s", err)
         return res
 
     def update(self):
@@ -250,19 +366,15 @@ class KeyBundle:
 
         This is a forced update, will happen even if cache time has not elapsed.
         """
-        res = True  # An update was successful
         if self.source:
-            # reread everything
-            self._keys = []
-
             if self.remote is False:
                 if self.fileformat == "jwk":
-                    self.do_local_jwk(self.source)
+                    self.do_local_jwk(self.source, replace=True)
                 elif self.fileformat == "der":
-                    self.do_local_der(self.source, self.keytype, self.keyusage)
+                    self.do_local_der(self.source, self.keytype, self.keyusage, replace=True)
             else:
-                res = self.do_remote()
-        return res
+                return self.do_remote()
+        return True
 
     def get(self, typ=""):
         """Return keys matching the typ.
@@ -270,21 +382,20 @@ class KeyBundle:
         :param typ: Type of key (rsa, ec, oct, ..)
         :return: If typ is undefined all the keys as a dictionary otherwise the appropriate keys in a list
         """
-        self._uptodate()
-        _typs = [typ.lower(), typ.upper()]
+        keys = self.keys()
 
         if typ:
-            return [k for k in self._keys if k.kty in _typs]
+            _typs = [typ.lower(), typ.upper()]
+            return [k for k in keys if k.kty in _typs]
         else:
-            return self._keys
+            return keys
 
     def keys(self):
         self._uptodate()
-
-        return self._keys
+        return self._snapshot()
 
     def available_keys(self):
-        return self._keys
+        return self._snapshot()
 
     def remove_key(self, typ, val=None):
         """Delete key given the type ot type and value.
@@ -292,18 +403,19 @@ class KeyBundle:
         :param typ: Type of key (rsa, ec, oct, ..)
         :param val: The key itself
         """
-        if val:
-            self._keys = [k for k in self._keys if not (k.kty == typ and k.key == val.key)]
-        else:
-            self._keys = [k for k in self._keys if not k.kty == typ]
+        with self._lock:
+            if val:
+                self._keys = [k for k in self._keys if not (k.kty == typ and k.key == val.key)]
+            else:
+                self._keys = [k for k in self._keys if not k.kty == typ]
+            self._generation += 1
 
     def __str__(self):
         return str(self.jwks())
 
     def jwks(self, private=False):
-        self._uptodate()
         keys = []
-        for k in self._keys:
+        for k in self.keys():
             if private:
                 key = k.serialize(private)
             else:
@@ -314,31 +426,50 @@ class KeyBundle:
         return json.dumps({"keys": keys})
 
     def append(self, key):
-        self._keys.append(key)
+        with self._lock:
+            self._keys = self._keys + [key]
+            self._generation += 1
 
     def remove(self, key):
-        self._keys.remove(key)
+        with self._lock:
+            keys = list(self._keys)
+            keys.remove(key)
+            self._keys = keys
+            self._generation += 1
 
     def __len__(self):
         return len(self._keys)
 
-    def get_key_with_kid(self, kid):
-        for key in self._keys:
-            if key.kid == kid:
-                return key
+    def get_keys_with_kid(self, kid):
+        """Return all keys with a given kid.
+
+        A kid is not guaranteed to be unique over time.  During a rotation the
+        same kid can be reused for a new key while the old key is still needed
+        to verify tokens that were issued before the rotation.  Returning all
+        matches lets the caller try each key instead of silently picking the
+        oldest (or the newest) one.
+        """
+        matches = [key for key in self._snapshot() if key.kid == kid]
+        if matches:
+            return matches
 
         # Try updating since there might have been an update to the key file
-        self.update()
+        if self.source:
+            self.update()
+            matches = [key for key in self._snapshot() if key.kid == kid]
 
-        for key in self._keys:
-            if key.kid == kid:
-                return key
+        return matches
 
+    def get_key_with_kid(self, kid):
+        keys = self.get_keys_with_kid(kid)
+        if keys:
+            # Prefer the most recently added key for signing.  Verification
+            # uses ``get_keys_with_kid`` and therefore sees all of them.
+            return keys[-1]
         return None
 
     def kids(self):
-        self._uptodate()
-        return [key.kid for key in self._keys if key.kid != ""]
+        return [key.kid for key in self.keys() if key.kid != ""]
 
     def remove_outdated(self, after):
         """Remove keys that should not be available any more.
@@ -354,14 +485,23 @@ class KeyBundle:
             except TypeError:
                 raise
 
-        _kl = []
-        for k in self._keys:
-            if k.inactive_since and k.inactive_since + after < now:
-                continue
-            else:
-                _kl.append(k)
+        with self._lock:
+            _kl = []
+            for k in self._keys:
+                if k.inactive_since and k.inactive_since + after < now:
+                    continue
+                else:
+                    _kl.append(k)
 
-        self._keys = _kl
+            if len(_kl) != len(self._keys):
+                self._keys = _kl
+                self._generation += 1
+
+    @property
+    def generation(self):
+        """Monotonically increasing identifier of the committed key set."""
+        with self._lock:
+            return self._generation
 
 
 def keybundle_from_local_file(filename, typ, usage):
@@ -538,9 +678,13 @@ class KeyJar:
                     if key.inactive_since and key_use != "ver":
                         # Skip inactive keys unless for signature verification
                         continue
-                    if kid and key.kid == kid:
-                        lst = [key]
-                        break
+                    if kid:
+                        # A kid can be shared by more than one key during a
+                        # rotation.  Return all of them so the verifier can
+                        # try each one instead of picking a stale key.
+                        if key.kid == kid and key not in lst:
+                            lst.append(key)
+                        continue
                     if not key.use or use == key.use:
                         lst.append(key)
                         continue
@@ -587,11 +731,19 @@ class KeyJar:
         :param owner: The owner of the key
         :return: a specific key instance or None
         """
-        for kb in self.issuer_keys[owner]:
-            _key = kb.get_key_with_kid(kid)
-            if _key:
-                return _key
+        keys = self.get_keys_by_kid(kid, owner)
+        if keys:
+            return keys[-1]
         return None
+
+    def get_keys_by_kid(self, kid, owner=""):
+        """Return all keys with a given kid owned by ``owner``."""
+        matching: list[KEYS] = []
+        for kb in self.issuer_keys[owner]:
+            for key in kb.get_keys_with_kid(kid):
+                if key not in matching:
+                    matching.append(key)
+        return matching
 
     def __contains__(self, item):
         if item in self.issuer_keys:
@@ -1109,6 +1261,35 @@ def update_keyjar(keyjar):
     for _iss, kbl in keyjar.items():
         for kb in kbl:
             kb.update()
+
+
+def verify_with_keys(jws_obj, token, keys):
+    """Verify a compact JWS by trying each candidate key.
+
+    ``jwkest`` picks a single key by ``kid`` and then verifies the signature.
+    That is not sufficient when a kid is reused for a new key during a JWKS
+    rotation: the first key with that kid can be the old one even though the
+    token was signed with the new one.  Trying the candidates one by one keeps
+    overlapping keys usable without weakening signature verification.
+
+    :param jws_obj: A ``jwkest.jws.JWS`` instance
+    :param token: The compact JWS
+    :param keys: Candidate verification keys
+    :return: The verified payload
+    """
+    if not keys:
+        raise NoSuitableSigningKeys("No keys available for signature verification")
+
+    last_error = None
+    for key in keys:
+        try:
+            return jws_obj.verify_compact(token, [key])
+        except Exception as err:  # noqa: BLE001 - try the remaining candidates
+            last_error = err
+
+    if last_error is not None:
+        raise last_error
+    raise NoSuitableSigningKeys("No suitable key for signature verification")
 
 
 def key_summary(keyjar, issuer):
