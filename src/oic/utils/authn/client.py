@@ -1,5 +1,6 @@
 import base64
 import logging
+import threading
 from urllib.parse import quote_plus
 
 from jwkest import Invalid, MissingKey, as_bytes
@@ -30,6 +31,65 @@ class NoMatchingKey(Exception):
 
 class UnknownAuthnMethod(Exception):
     pass
+
+
+class ClientAssertionReplayCache:
+    """Keep track of client assertion identifiers that have already been used.
+
+    An assertion is identified by the issuer, subject, JWT ID and client ID.
+    The client ID is part of the key so that assertions belonging to different
+    clients can never share a replay entry.
+    """
+
+    def __init__(self):
+        self._entries = {}
+        self._lock = threading.Lock()
+
+    def add(self, iss, sub, jti, client_id, expires_at):
+        """Remember an assertion and return ``False`` if it has already been seen."""
+        key = (iss, sub, jti, client_id)
+        now = utc_time_sans_frac()
+
+        with self._lock:
+            # Assertions can no longer be replayed once they have expired, so
+            # there is no point in keeping them around forever.
+            self._entries = {_key: _exp for _key, _exp in self._entries.items() if _exp >= now}
+            if key in self._entries:
+                return False
+
+            self._entries[key] = expires_at
+            return True
+
+
+def _client_assertion_claims(bjwt):
+    """Extract and validate the claims needed for replay protection."""
+    try:
+        iss = bjwt["iss"]
+        sub = bjwt["sub"]
+        jti = bjwt["jti"]
+        exp = bjwt["exp"]
+        aud = bjwt["aud"]
+    except KeyError:
+        raise AuthnFailure("Could not verify client_assertion.") from None
+
+    if not all(isinstance(value, str) and value for value in (iss, sub, jti)):
+        raise AuthnFailure("Could not verify client_assertion.")
+    if not isinstance(exp, int):
+        raise AuthnFailure("Could not verify client_assertion.")
+
+    return iss, sub, jti, exp, aud
+
+
+def _check_client_assertion_replay(client, iss, sub, jti, cid, exp):
+    """Reject an assertion that has already been used by the same client."""
+    replay_cache = getattr(client, "client_assertion_replay_cache", None)
+    if replay_cache is None:
+        replay_cache = ClientAssertionReplayCache()
+        client.client_assertion_replay_cache = replay_cache
+
+    if not replay_cache.add(iss, sub, jti, cid, exp):
+        logger.warning("Replay of client assertion detected for client: %s", cid)
+        raise AuthnFailure("Could not verify client_assertion.")
 
 
 # ========================================================================
@@ -349,17 +409,29 @@ class JWSAuthnMethod(ClientAuthnMethod):
         logger.debug("authntoken: %s", sanitize(bjwt.to_dict()))
         areq["parsed_client_assertion"] = bjwt
 
+        iss, sub, jti, exp, _aud = _client_assertion_claims(bjwt)
+
         try:
             cid = kwargs["client_id"]
         except KeyError:
-            cid = bjwt["iss"]
+            cid = iss
 
-            # There might not be a client_id in the request
         if cid not in self.cli.cdb:
             raise AuthnFailure("Unknown client id")
 
+        # According to RFC 7523, both ``iss`` and ``sub`` identify the client
+        # that authenticated.  Refuse assertions that were issued for another
+        # client instead of silently authenticating the issuer of the token.
+        if iss != cid or sub != cid:
+            logger.warning("Client assertion does not belong to client: %s", cid)
+            raise AuthnFailure("Could not verify client_assertion.")
+
+        # A client_id in the request must not contradict the assertion.
+        if "client_id" in areq and areq["client_id"] != cid:
+            logger.warning("Client assertion does not match request client_id: %s", cid)
+            raise AuthnFailure("Could not verify client_assertion.")
+
         # aud can be a string or a list
-        _aud = bjwt["aud"]
         logger.debug("audience: %s, baseurl: %s", _aud, self.cli.baseurl)
 
         # figure out authn method
@@ -374,8 +446,15 @@ class JWSAuthnMethod(ClientAuthnMethod):
         else:
             for target in _aud:
                 if target.startswith(self.cli.baseurl):
-                    return cid, authn_method
-            raise NotForMe("Not for me!")
+                    break
+            else:
+                raise NotForMe("Not for me!")
+
+        if exp < utc_time_sans_frac():
+            logger.info("Client assertion has expired")
+            raise AuthnFailure("Could not verify client_assertion.")
+
+        _check_client_assertion_replay(self.cli, iss, sub, jti, cid, exp)
 
         return cid, authn_method
 

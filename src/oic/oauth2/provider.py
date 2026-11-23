@@ -36,6 +36,7 @@ from oic.oauth2.message import (
 )
 from oic.utils import sort_sign_alg
 from oic.utils.authn.client import AuthnFailure
+from oic.utils.authn.client import ClientAssertionReplayCache
 from oic.utils.authn.user import NoSuchAuthentication, TamperAllert, ToOld
 from oic.utils.clientdb import BaseClientDatabase
 from oic.utils.http_util import (
@@ -238,6 +239,7 @@ class Provider:
 
         self.authz = authz
         self.client_authn = client_authn
+        self.client_assertion_replay_cache = ClientAssertionReplayCache()
         self.symkey = symkey
         self.seed = rndstr().encode("utf-8")
         self.iv = iv or os.urandom(16)
