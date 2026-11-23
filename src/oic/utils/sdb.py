@@ -412,6 +412,11 @@ class SessionDB:
                 stacklevel=2,
             )
         self._db = db
+        # Revocations for users whose sessions have already been removed must
+        # still be visible to callers that retry a logout or consume a stale
+        # token.  A new authentication creates a new generation and clears the
+        # marker for that user.
+        self._revoked_uids: dict[str, str] = {}
 
         self.sm_salt = sm_salt or rndstr(32)
 
@@ -595,6 +600,7 @@ class SessionDB:
             _dic["oidreq"] = oidreq.to_json()
 
         self._db[sid] = _dic
+        self._revoked_uids.pop(aevent.uid, None)
 
         return sid
 
@@ -709,6 +715,9 @@ class SessionDB:
                     except KeyError:
                         dic = _info
 
+                if self._is_session_revocation(dic) or self._uid_is_revoked(dic):
+                    raise ExpiredToken
+
                 access_token = self.access_token(sid=sid, sinfo=dic)
                 try:
                     at = dic["access_token"]
@@ -730,6 +739,10 @@ class SessionDB:
             except KeyError:
                 # Session is cleared, use the storage in token factory
                 dic = self.token_factory["refresh_token"].token_storage[sid]
+
+            if self._is_session_revocation(dic) or self._uid_is_revoked(dic):
+                raise ExpiredToken
+
             access_token = self.access_token(sid=sid, sinfo=dic)
 
             try:
@@ -747,7 +760,7 @@ class SessionDB:
         dic["access_token"] = access_token
         dic["token_type"] = "Bearer"  # nosec
         dic["refresh_token"] = rtoken
-        dic["revoked"] = False
+        self._clear_token_revocation(dic)
         self._db[sid] = dic
         return dic
 
@@ -770,7 +783,12 @@ class SessionDB:
         if self.is_revoked(sid):
             return False
 
-        _dic = self._db[sid]
+        try:
+            _dic = self._db[sid]
+        except KeyError:
+            # The session was removed (for example by an older logout
+            # implementation).  Its tokens cannot be valid any more.
+            return False
 
         if typ == "A":
             if _dic["code"] != token:
@@ -798,6 +816,114 @@ class SessionDB:
         except KeyError:
             return False
 
+    @staticmethod
+    def _is_session_revocation(session_info) -> bool:
+        """Return whether session information carries a session-wide revocation.
+
+        Revoking a single access token is intentionally different from logging a
+        session out: the former only invalidates that token and a refresh may
+        legitimately replace it, while the latter must also prevent the refresh
+        token from resurrecting the session.  Older sessions only have the
+        boolean ``revoked`` flag, which is treated as session-wide.
+        """
+        if not session_info.get("revoked"):
+            return False
+        return session_info.get("revocation_scope") != "token"
+
+    @staticmethod
+    def _clear_token_revocation(session_info) -> None:
+        """Clear a token-only revocation after a successful refresh."""
+        if session_info.get("revocation_scope") == "token":
+            session_info["revoked"] = False
+            session_info.pop("revocation_scope", None)
+            session_info.pop("revocation_generation", None)
+            session_info.pop("revoked_generation", None)
+        else:
+            session_info.setdefault("revoked", False)
+
+    def _uid_is_revoked(self, session_info) -> bool:
+        """Return whether the uid in session information has a live revocation."""
+        uid = session_info.get("uid")
+        if uid is None:
+            try:
+                uid = AuthnEvent.from_json(session_info["authn_event"]).uid
+            except (KeyError, TypeError, ValueError):
+                return False
+        return uid in self._revoked_uids
+
+    def _invalidate_session_refresh_token(self, session_info) -> None:
+        """Invalidate the refresh token bound to a session, if there is one."""
+        rtoken = session_info.get("refresh_token")
+        if not rtoken:
+            return
+        try:
+            self.revoke_refresh_token(rtoken)
+        except Exception:  # nosec - logout must not fail because of a broken token
+            logger.warning("Could not invalidate refresh token during revocation", exc_info=True)
+
+    def revoke_sessions(self, sids, scope: str = "sid", generation: str | None = None) -> str:
+        """Revoke a set of sessions as one generation.
+
+        All sessions in ``sids`` are marked revoked with the same generation
+        identifier.  Their refresh tokens are invalidated in the same operation,
+        so a later refresh request cannot restore the revoked user.
+
+        :param sids: Session identifiers to revoke
+        :param scope: What the revocation applies to (``sid``, ``client`` or ``uid``)
+        :param generation: Optional generation to reuse, e.g. when retrying logout
+        :return: The revocation generation
+        """
+        resolved_sids = []
+        for sid in sids:
+            if sid in self._db:
+                resolved_sids.append(sid)
+                continue
+            try:
+                resolved_sids.append(self._get_token_key(sid))
+            except KeyError:
+                continue
+        sids = [sid for sid in dict.fromkeys(resolved_sids) if sid in self._db]
+        session_infos = [self._db[sid] for sid in sids]
+
+        if generation is None:
+            generations = {
+                info.get("revocation_generation")
+                for info in session_infos
+                if info.get("revoked") and info.get("revocation_generation")
+            }
+            if (
+                session_infos
+                and all(info.get("revoked") for info in session_infos)
+                and all(info.get("revocation_scope") == scope for info in session_infos)
+                and len(generations) == 1
+            ):
+                generation = generations.pop()
+            else:
+                generation = uuid.uuid4().urn
+
+        for sid, info in zip(sids, session_infos):
+            info["revoked"] = True
+            info["revocation_generation"] = generation
+            # Keep an explicit alias for consumers that refer to the generation
+            # by the revoked state rather than by the revocation itself.
+            info["revoked_generation"] = generation
+            info["revocation_scope"] = scope
+            self._db[sid] = info
+            self._invalidate_session_refresh_token(info)
+
+        return generation
+
+    def revoke_session(self, sid: str) -> str:
+        """Revoke one session and return the revocation generation."""
+        return self.revoke_sessions([sid], scope="sid")
+
+    def get_revocation_generation(self, sid: str) -> str | None:
+        """Return the revocation generation of a session, if it was revoked."""
+        try:
+            return self._db[sid].get("revocation_generation")
+        except KeyError:
+            return None
+
     def revoke_token(self, token):
         """Revoke access token.
 
@@ -805,7 +931,17 @@ class SessionDB:
         """
         _, sid = self._get_token_type_and_key(token)
 
+        try:
+            session_info = self._db[sid]
+        except KeyError:
+            return True
+        if session_info.get("revoked") and session_info.get("revocation_scope") in ("sid", "client", "uid"):
+            # A token revocation must never weaken a session-wide logout.
+            return True
+
         self.update(sid, "revoked", True)
+        self.update(sid, "revocation_scope", "token")
+        self.update(sid, "revocation_generation", uuid.uuid4().urn)
         return True
 
     def revoke_refresh_token(self, rtoken):
@@ -827,14 +963,7 @@ class SessionDB:
         """
         _, sid = self._get_token_type_and_key(token)
 
-        try:
-            rtoken = self._db[sid]["refresh_token"]
-        except KeyError:
-            pass
-        else:
-            self.revoke_refresh_token(rtoken)
-
-        self.revoke_token(token)
+        self.revoke_sessions([sid], scope="sid")
         return True
 
     def get_client_id_for_session(self, sid):
@@ -855,18 +984,45 @@ class SessionDB:
 
     def set_verify_logout(self, uid: str) -> None:
         """Save the key that is used for logout verification."""
+        logout_key = uuid.uuid4().urn
         for sid in self._db.get_by_uid(uid):
             _dict = self._db[sid]
-            _dict["verified_logout"] = uuid.uuid4().urn
+            _dict["verified_logout"] = logout_key
+            self._db[sid] = _dict
 
     def is_revoke_uid(self, uid: str) -> bool:
         """Return if the uid session has been revoked."""
-        return self._db.is_revoke_uid(uid)
+        sids = self._db.get_by_uid(uid)
+        if sids:
+            if self._db.is_revoke_uid(uid):
+                return True
+            # All current sessions belong to a newer authentication
+            # generation, so a marker left over from removed sessions no
+            # longer applies.
+            self._revoked_uids.pop(uid, None)
+            return False
+        return uid in self._revoked_uids
 
     def revoke_uid(self, uid: str) -> None:
         """Mark all sessions for the given uid as revoked."""
-        for sid in self._db.get_by_uid(uid):
-            self.update(sid, "revoked", True)
+        generation = self.revoke_sessions(
+            self._db.get_by_uid(uid),
+            scope="uid",
+            generation=self._revoked_uids.get(uid),
+        )
+        self._revoked_uids[uid] = generation
+
+    def revoke_client(self, client_id: str, uid: str | None = None) -> None:
+        """Revoke the sessions of one client, optionally restricted to a uid."""
+        if uid is None:
+            sids = self.get("client_id", client_id)
+        else:
+            sids = [
+                sid
+                for sid in self._db.get_by_uid(uid)
+                if self._db[sid].get("client_id") == client_id
+            ]
+        self.revoke_sessions(sids, scope="client")
 
     def duplicate(self, sinfo):
         _dic = copy.copy(sinfo)

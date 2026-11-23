@@ -1162,7 +1162,13 @@ class Provider(AProvider):
 
         if _sdb.is_revoked(key):
             return error_response("invalid_token", descr="Token is revoked", status_code=401)
-        session = _sdb[key]
+        try:
+            session = _sdb[key]
+        except KeyError:
+            # The session may have been removed by an older logout
+            # implementation.  Never turn a stale access token into a server
+            # error; it is simply no longer valid.
+            return error_response("invalid_token", descr="Token is revoked", status_code=401)
 
         # Scope can translate to userinfo_claims
 
@@ -2034,7 +2040,12 @@ class Provider(AProvider):
         for sid in usids:
             del _sdb[sid]
 
-    def logout_info_for_all_clients(self, uid: str | None = "", sid: str | None = "") -> dict:
+    def logout_info_for_all_clients(
+        self,
+        uid: str | None = "",
+        sid: str | None = "",
+        session_ids: list[str] | None = None,
+    ) -> dict:
         """Collect information necessary to logout one user from all clients he/she has been using.
 
         One of uid and sid MUST be provided. If uid is provided sid is ignored.
@@ -2042,6 +2053,7 @@ class Provider(AProvider):
         No logout is actually performed
         :param uid: User ID
         :param sid: Session ID
+        :param session_ids: Optional subset of session IDs to use
         :return: Dictionary with logout information
         """
         if not uid:
@@ -2051,7 +2063,7 @@ class Provider(AProvider):
                 uid = self.sdb.get_uid_by_sid(sid)
 
         # Find all the session IDs this user has gotten
-        usids = session_get(self.sdb, "uid", uid)
+        usids = list(session_ids) if session_ids is not None else session_get(self.sdb, "uid", uid)
         # Find all RPs this user has logged it from
         _client_sid = {}
         for usid in usids:
@@ -2177,6 +2189,15 @@ class Provider(AProvider):
         if client_id not in self.cdb:
             return error_response("invalid_request", "Unknown client")
 
+        if not sid and uid is not None:
+            # A cookie identifies the user and the client but not the session
+            # row.  Resolve the matching session so a logout (and especially a
+            # retry after a failed back-channel request) has a concrete target.
+            for _sid in session_get(self.sdb, "uid", uid):
+                if self.sdb[_sid].get("client_id") == client_id:
+                    sid = _sid
+                    break
+
         if "post_logout_redirect_uri" in esr:
             redirect_uri = self.verify_post_logout_redirect_uri(esr, client_id)
             if not redirect_uri:
@@ -2206,11 +2227,29 @@ class Provider(AProvider):
                     )
 
         # redirect user to OP logout verification page
+        _alla = kwargs.get("alla")
+        if _alla is None:
+            # An id_token_hint identifies the user's OP session rather than
+            # only the client that received that particular ID Token.  Logging
+            # out through such a hint therefore has to cover every client.
+            _alla = "id_token_hint" in esr
+        elif isinstance(_alla, str):
+            _alla = _alla.strip().lower() not in ("", "0", "false", "no")
+
+        if uid is None:
+            _sids = [sid]
+        elif _alla:
+            _sids = session_get(self.sdb, "uid", uid) or [sid]
+        else:
+            _sids = [sid]
+
         payload = {
             "uid": uid,
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "sid": sid,
+            "alla": bool(_alla),
+            "sids": _sids,
         }
         if "state" in esr:
             payload["state"] = esr["state"]
@@ -2244,12 +2283,45 @@ class Provider(AProvider):
         """
         if alla:
             uid = self.sdb.get_uid_by_sid(sid)
-            logout_spec = self.logout_info_for_all_clients(uid)
-            # Find all the session IDs this user has gotten
+            scope = "uid"
+            generation = None
             sids = session_get(self.sdb, "uid", uid)
+            requested_sids = kwargs.get("sids")
+            if requested_sids:
+                sids = [requested_sid for requested_sid in requested_sids if requested_sid in self.sdb]
+            sid_info = self.sdb[sid]
+            if sid_info.get("revoked") and sid_info.get("revocation_scope") == "uid":
+                generation = sid_info.get("revocation_generation")
+                if generation:
+                    # A retry of an all-client logout must only touch the
+                    # sessions committed by the original revocation.  A new
+                    # login may have happened in the meantime and belongs to a
+                    # new generation.
+                    sids = [
+                        _sid
+                        for _sid in sids
+                        if self.sdb[_sid].get("revocation_generation") == generation
+                    ]
+            logout_spec = self.logout_info_for_all_clients(uid, session_ids=sids)
         else:
             logout_spec = self.logout_info_for_one_client(session_id=sid, client_id=client_id)
             sids = [sid]
+            scope = "sid"
+            generation = None
+            sid_info = self.sdb[sid]
+            if sid_info.get("revoked") and sid_info.get("revocation_scope") in ("sid", "client", "uid"):
+                generation = sid_info.get("revocation_generation")
+
+        # Commit the revocation before contacting the clients.  A failed
+        # back-channel request may be retried, but it must never be able to
+        # bring an already revoked session (and the uid behind it) back to
+        # life.  Keeping the revoked sessions also makes a retry able to read
+        # back every target session.
+        if generation is None:
+            if scope == "uid":
+                self.sdb.revoke_uid(uid)
+            else:
+                self.sdb.revoke_sessions(sids, scope=scope)
 
         if self.events:
             self.events.store("object args", "{}".format(logout_spec))
@@ -2306,9 +2378,6 @@ class Provider(AProvider):
             for _cid in logout_spec["front_channel"].keys():
                 logger.info("Adding logout iframe for %s", _cid)
             res["iframe"] = list(logout_spec["front_channel"].values())
-
-        # Clean out all sessions
-        self.clean_sessions(sids)
 
         return res
 
