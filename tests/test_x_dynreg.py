@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 
@@ -260,6 +261,90 @@ class TestProvider:
         )
 
         assert isinstance(resp, Unauthorized)
+
+    def test_client_registration_cross_client_token(self):
+        # Register two clients
+        args = {
+            "redirect_uris": [
+                "https://client.example.org/callback",
+                "https://client.example.org/callback2",
+            ],
+            "client_name": "Client A",
+            "token_endpoint_auth_method": "client_secret_basic",
+            "scope": "read write dolphin",
+        }
+        request = RegistrationRequest(**args)
+        resp = self.provider.registration_endpoint(request=request.to_json(), environ={})
+        _resp_a = ClientInfoResponse().from_json(resp.message)
+
+        args["client_name"] = "Client B"
+        request = RegistrationRequest(**args)
+        resp = self.provider.registration_endpoint(request=request.to_json(), environ={})
+        _resp_b = ClientInfoResponse().from_json(resp.message)
+
+        assert _resp_a["client_id"] != _resp_b["client_id"]
+        assert _resp_a["registration_access_token"] != _resp_b["registration_access_token"]
+
+        # Snapshot client B's stored registration
+        _before = copy.deepcopy(self.provider.cdb[_resp_b["client_id"]])
+
+        # Client A's token must not authorize reading client B's info
+        resp = self.provider.client_info_endpoint(
+            "GET",
+            environ={"HTTP_AUTHORIZATION": "Bearer {}".format(_resp_a["registration_access_token"])},
+            query="client_id={}".format(_resp_b["client_id"]),
+            request="",
+        )
+        assert isinstance(resp, Unauthorized)
+
+        # Client A's token must not authorize altering client B's info
+        update = {
+            "client_id": _resp_b["client_id"],
+            "client_secret": _resp_b["client_secret"],
+            "redirect_uris": ["https://evil.example.org/callback"],
+            "client_name": "Hijacked Client",
+        }
+        update_req = RegistrationRequest(**update)
+        resp = self.provider.client_info_endpoint(
+            request=update_req.to_json(),
+            environ={"HTTP_AUTHORIZATION": "Bearer {}".format(_resp_a["registration_access_token"])},
+            method="PUT",
+            query="client_id={}".format(_resp_b["client_id"]),
+        )
+        assert isinstance(resp, Unauthorized)
+
+        # Client A's token must not authorize deleting client B's info
+        resp = self.provider.client_info_endpoint(
+            request="",
+            environ={"HTTP_AUTHORIZATION": "Bearer {}".format(_resp_a["registration_access_token"])},
+            method="DELETE",
+            query="client_id={}".format(_resp_b["client_id"]),
+        )
+        assert isinstance(resp, Unauthorized)
+
+        # A made-up token must not authorize anything either
+        resp = self.provider.client_info_endpoint(
+            "GET",
+            environ={"HTTP_AUTHORIZATION": "Bearer made-up-token"},
+            query="client_id={}".format(_resp_b["client_id"]),
+            request="",
+        )
+        assert isinstance(resp, Unauthorized)
+
+        # Client B's registration must be untouched
+        assert _resp_b["client_id"] in self.provider.cdb
+        assert self.provider.cdb[_resp_b["client_id"]] == _before
+
+        # Client B's own token still works
+        resp = self.provider.client_info_endpoint(
+            "GET",
+            environ={"HTTP_AUTHORIZATION": "Bearer {}".format(_resp_b["registration_access_token"])},
+            query="client_id={}".format(_resp_b["client_id"]),
+            request="",
+        )
+        _resp_cir = ClientInfoResponse().from_json(resp.message)
+        assert _resp_cir["client_id"] == _resp_b["client_id"]
+        assert _resp_cir["client_name"] == "Client B"
 
     def test_client_registration_with_software_statement(self):
         jwks, keyjar, kidd = build_keyjar(KEYS)

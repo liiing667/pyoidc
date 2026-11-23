@@ -3,7 +3,7 @@ import logging
 import socket
 from urllib.parse import parse_qs, urlparse
 
-from jwkest import b64e
+from jwkest import b64e, safe_str_cmp
 
 from oic import rndstr
 from oic.exception import (
@@ -464,8 +464,14 @@ class Provider(provider.Provider):
 
         # authenticated client
         try:
-            self.verify_client(kwargs["environ"], kwargs["request"], "bearer_header", client_id=_id)
+            token = self.verify_client(kwargs["environ"], kwargs["request"], "bearer_header", client_id=_id)
         except (AuthnFailure, UnknownAssertionType):
+            return Unauthorized()
+
+        # The registration access token is bound to the client it was issued
+        # for; a token belonging to one client must not authorize operations
+        # on another client's registration.
+        if not token or not safe_str_cmp(self.cdb[_id].get("registration_access_token", ""), token):
             return Unauthorized()
 
         if method == "GET":
