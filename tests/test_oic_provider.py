@@ -1863,6 +1863,144 @@ class TestProvider:
 
         self.provider._verify_redirect_uri(areq)
 
+    @pytest.mark.parametrize(
+        ("registered_uri", "request_uri"),
+        [
+            ("https://example.org/cb", "https://example.org/cb/"),
+            ("https://example.org/cb/", "https://example.org/cb"),
+            ("https://example.org:8080/cb", "https://example.org:9090/cb"),
+        ],
+    )
+    def test_verify_redirect_uri_exact_identity_rejects_equivalent_looking_uri(self, registered_uri, request_uri):
+        client_id = "loopback-client"
+        self.provider.cdb[client_id] = {"redirect_uris": [(registered_uri, None)]}
+        areq = AuthorizationRequest(
+            redirect_uri=request_uri,
+            client_id=client_id,
+            scope="openid",
+            response_type="code",
+        )
+
+        with pytest.raises(RedirectURIError):
+            self.provider._verify_redirect_uri(areq)
+
+    def test_verify_redirect_uri_loopback_aliases_and_ports_match(self):
+        client_id = "loopback-client"
+        self.provider.cdb[client_id] = {"redirect_uris": [("http://127.0.0.1:8080/cb", None)]}
+
+        for uri in [
+            "http://127.0.0.1:9090/cb",
+            "http://localhost:9090/cb",
+            "http://127.1:9090/cb",
+            "http://[::ffff:127.0.0.1]:9090/cb",
+        ]:
+            areq = AuthorizationRequest(
+                redirect_uri=uri,
+                client_id=client_id,
+                scope="openid",
+                response_type="code",
+            )
+            assert self.provider._verify_redirect_uri(areq) is None
+
+        self.provider.cdb[client_id]["redirect_uris"] = [("http://[::1]:8080/cb", None)]
+        areq = AuthorizationRequest(
+            redirect_uri="http://[0:0:0:0:0:0:0:1]:9090/cb",
+            client_id=client_id,
+            scope="openid",
+            response_type="code",
+        )
+        assert self.provider._verify_redirect_uri(areq) is None
+
+    def test_registered_native_loopback_uri_matches_authorization_alias(self):
+        registration = RegistrationRequest(
+            redirect_uris=["http://127.0.0.1:8080/cb"],
+            application_type="native",
+        )
+        response = self.provider.registration_endpoint(request=registration.to_json())
+        client_id = RegistrationResponse().from_json(response.message)["client_id"]
+        areq = AuthorizationRequest(
+            redirect_uri="http://localhost:9090/cb",
+            client_id=client_id,
+            scope="openid",
+            response_type="code",
+        )
+
+        assert self.provider._verify_redirect_uri(areq) is None
+
+    def test_registered_trailing_slash_keeps_exact_authorization_identity(self):
+        registration = RegistrationRequest(
+            redirect_uris=["https://example.org/cb/"],
+            response_types=["code"],
+        )
+        response = self.provider.registration_endpoint(request=registration.to_json())
+        client_id = RegistrationResponse().from_json(response.message)["client_id"]
+        areq = AuthorizationRequest(
+            redirect_uri="https://example.org/cb",
+            client_id=client_id,
+            scope="openid",
+            response_type="code",
+        )
+
+        with pytest.raises(RedirectURIError):
+            self.provider._verify_redirect_uri(areq)
+
+    def test_authorization_redirect_uri_with_fragment_is_rejected(self):
+        client_id = "fragment-client"
+        self.provider.cdb[client_id] = {"redirect_uris": [("https://example.org/cb", None)]}
+        areq = AuthorizationRequest(
+            redirect_uri="https://example.org/cb#fragment",
+            client_id=client_id,
+            scope="openid",
+            response_type="code",
+        )
+
+        with pytest.raises(RedirectURIError):
+            self.provider._verify_redirect_uri(areq)
+
+    def test_registration_client_record_preserves_uri_identity(self):
+        registration = RegistrationRequest(
+            redirect_uris=["https://example.org/cb/?foo=bar"],
+            response_types=["code"],
+        )
+
+        response = self.provider.registration_endpoint(request=registration.to_json())
+        client_id = RegistrationResponse().from_json(response.message)["client_id"]
+
+        assert self.provider.cdb[client_id]["redirect_uris"] == [
+            ("https://example.org/cb/", {"foo": ["bar"]})
+        ]
+
+        authn = "Bearer {}".format(self.provider.cdb[client_id]["registration_access_token"])
+        read_response = self.provider.read_registration(authn, "client_id={}".format(client_id))
+        assert json.loads(read_response.message)["redirect_uris"] == ["https://example.org/cb/?foo=bar"]
+
+    @pytest.mark.parametrize(
+        "stored_uris",
+        [
+            ["https://example.org/cb"],
+            [["https://example.org/cb", None]],
+            [["https://example.org/cb", ""]],
+            [("https://example.org/cb", "foo=bar")],
+        ],
+    )
+    def test_verify_redirect_uri_accepts_old_client_records(self, stored_uris):
+        client_id = "legacy-client"
+        self.provider.cdb[client_id] = {"redirect_uris": stored_uris}
+        has_registered_query = isinstance(stored_uris[0], (tuple, list)) and stored_uris[0][1] == "foo=bar"
+        request_uri = (
+            "https://example.org/cb?foo=bar"
+            if has_registered_query
+            else "https://example.org/cb"
+        )
+        areq = AuthorizationRequest(
+            redirect_uri=request_uri,
+            client_id=client_id,
+            scope="openid",
+            response_type="code",
+        )
+
+        assert self.provider._verify_redirect_uri(areq) is None
+
     def test_verify_redirect_uri_native_http_localhost(self):
         areq = RegistrationRequest(redirect_uris=["http://localhost/cb"], application_type="native")
 
@@ -1909,6 +2047,21 @@ class TestProvider:
         resp = self.provider.read_registration(authn, query)
 
         assert json.loads(resp.message) == regresp.to_dict()
+
+    def test_read_registration_accepts_old_string_client_record(self):
+        client_id = "legacy-reader"
+        self.provider.cdb[client_id] = {
+            "client_id": client_id,
+            "registration_access_token": "legacy-token",
+            "redirect_uris": ["https://example.org/cb?foo=bar"],
+            "post_logout_redirect_uris": ["https://example.org/logout"],
+        }
+
+        resp = self.provider.read_registration("Bearer legacy-token", "client_id=legacy-reader")
+
+        metadata = json.loads(resp.message)
+        assert metadata["redirect_uris"] == ["https://example.org/cb?foo=bar"]
+        assert metadata["post_logout_redirect_uris"] == ["https://example.org/logout"]
 
     def test_read_registration_malformed_authn(self):
         resp = self.provider.read_registration("wrong string", "request")

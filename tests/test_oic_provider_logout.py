@@ -463,6 +463,96 @@ class TestProvider:
         assert jwt_info["client_id"] == "number5"
         assert jwt_info["redirect_uri"] == "https://example.com/post_logout"
 
+    def test_end_session_endpoint_default_old_string_post_logout_redirect_uri(self):
+        self._code_auth()
+        cookie = self._create_cookie("username", "number5")
+        self.provider.cdb["number5"]["post_logout_redirect_uris"] = [
+            "https://example.com/post_logout?foo=bar"
+        ]
+
+        resp = self.provider.end_session_endpoint(urlencode({"state": "abcde"}), cookie=cookie)
+
+        qs = parse_qs(urlparse(resp.message).query)
+        jwt_info = self.provider.unpack_signed_jwt(qs["sjwt"][0])
+        assert jwt_info["redirect_uri"] == "https://example.com/post_logout?foo=bar"
+
+    @pytest.mark.parametrize(
+        "stored_uris",
+        [
+            ["https://example.com/post_logout"],
+            [["https://example.com/post_logout", None]],
+            [["https://example.com/post_logout", ""]],
+            [("https://example.com/post_logout", "foo=bar")],
+        ],
+    )
+    def test_post_logout_redirect_uri_accepts_old_client_records(self, stored_uris):
+        self.provider.cdb["number5"]["post_logout_redirect_uris"] = stored_uris
+        has_registered_query = isinstance(stored_uris[0], (tuple, list)) and stored_uris[0][1] == "foo=bar"
+        request_uri = (
+            "https://example.com/post_logout?foo=bar"
+            if has_registered_query
+            else "https://example.com/post_logout"
+        )
+        esr = EndSessionRequest(state="foo", post_logout_redirect_uri=request_uri)
+
+        assert self.provider.verify_post_logout_redirect_uri(esr, "number5") == request_uri
+
+    def test_post_logout_loopback_aliases_and_ports_match(self):
+        self.provider.cdb["number5"]["post_logout_redirect_uris"] = [
+            ("http://127.0.0.1:8080/logout", None)
+        ]
+        for uri in [
+            "http://localhost:9090/logout",
+            "http://127.1:9090/logout",
+        ]:
+            esr = EndSessionRequest(state="foo", post_logout_redirect_uri=uri)
+
+            assert self.provider.verify_post_logout_redirect_uri(esr, "number5") == uri
+
+        self.provider.cdb["number5"]["post_logout_redirect_uris"] = [("http://[::1]:8080/logout", None)]
+        esr = EndSessionRequest(
+            state="foo",
+            post_logout_redirect_uri="http://[0:0:0:0:0:0:0:1]:9090/logout",
+        )
+        assert (
+            self.provider.verify_post_logout_redirect_uri(esr, "number5")
+            == "http://[0:0:0:0:0:0:0:1]:9090/logout"
+        )
+
+    def test_registered_post_logout_uri_keeps_exact_path_and_query_identity(self):
+        self.provider.cdb["number5"]["post_logout_redirect_uris"] = [
+            ("https://example.com/logout", {"foo": ["bar"]})
+        ]
+
+        same_path_with_extra_query = EndSessionRequest(
+            state="foo",
+            post_logout_redirect_uri="https://example.com/logout?foo=bar&baz=qux",
+        )
+        assert (
+            self.provider.verify_post_logout_redirect_uri(same_path_with_extra_query, "number5")
+            == same_path_with_extra_query["post_logout_redirect_uri"]
+        )
+
+        different_path = EndSessionRequest(
+            state="foo",
+            post_logout_redirect_uri="https://example.com/other?foo=bar",
+        )
+        assert self.provider.verify_post_logout_redirect_uri(different_path, "number5") is None
+
+        missing_registered_query = EndSessionRequest(
+            state="foo",
+            post_logout_redirect_uri="https://example.com/logout?baz=qux",
+        )
+        assert self.provider.verify_post_logout_redirect_uri(missing_registered_query, "number5") is None
+
+    def test_post_logout_redirect_uri_with_fragment_is_rejected(self):
+        self.provider.cdb["number5"]["post_logout_redirect_uris"] = [
+            ("https://example.com/logout", None)
+        ]
+        esr = EndSessionRequest(state="foo", post_logout_redirect_uri="https://example.com/logout#fragment")
+
+        assert self.provider.verify_post_logout_redirect_uri(esr, "number5") is None
+
     def test_end_session_endpoint_without_post_logout_redirect_uri(self):
         # default post logout page registered
         self.provider.post_logout_page = "https://foo.example.com/def_post"

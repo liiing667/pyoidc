@@ -22,7 +22,14 @@ from jwkest.jws import NoSuitableSigningKeys, alg2keytype
 from requests import RequestException
 
 from oic import rndstr
-from oic.exception import FailedAuthentication, InvalidRequest, MessageException, NotForMe, ParameterError, UnSupported
+from oic.exception import (
+    FailedAuthentication,
+    InvalidRequest,
+    MessageException,
+    NotForMe,
+    ParameterError,
+    UnSupported,
+)
 from oic.oauth2 import compact, error_response, redirect_authz_error
 from oic.oauth2.base import PBase
 from oic.oauth2.exception import CapabilitiesMisMatch, VerificationError
@@ -194,6 +201,139 @@ def _parse_registered_uri(
             "setting".format(name, p.scheme)
         )
     return p
+
+
+RegisteredQuery = str | dict[str, list[str]] | None
+RegisteredURITuple = tuple[str, dict[str, list[str]] | None]
+RegisteredURI = str | tuple[str, RegisteredQuery] | list[str | RegisteredQuery]
+
+
+def _normalize_loopback_uri(part: ParseResult) -> ParseResult:
+    """Normalize the host forms that identify the same loopback interface.
+
+    RFC 8252 allows native applications to use different loopback IP
+    representations and an ephemeral port. Keep the port in the identity for
+    non-loopback URIs, but remove it for loopback URIs and normalize IPv4 and
+    IPv6 loopback hosts separately.
+    """
+    if part.scheme not in ("http", "https") or not _is_loopback_host(part.hostname):
+        return part
+
+    hostname = part.hostname.rstrip(".")
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            ip = ipaddress.IPv4Address(socket.inet_aton(hostname))
+        except OSError:
+            ip = ipaddress.IPv4Address("127.0.0.1")
+
+    if isinstance(ip, ipaddress.IPv6Address):
+        return part._replace(netloc="[::1]")
+
+    return part._replace(netloc="127.0.0.1")
+
+
+def _parse_stored_uri(item: RegisteredURI) -> RegisteredURITuple | None:
+    """Parse a URI from a client record, including old string/list formats."""
+    if isinstance(item, str):
+        part = urlparse(item)
+        stored_query: RegisteredQuery = parse_qs(part.query) or None
+    elif isinstance(item, (tuple, list)) and len(item) == 2 and isinstance(item[0], str):
+        part = urlparse(item[0])
+        stored_query = item[1]
+    else:
+        return None
+
+    try:
+        query = _parse_stored_query(stored_query)
+    except ValueError:
+        return None
+
+    part = _normalize_loopback_uri(part)
+    return part.geturl(), query
+
+
+def _parse_stored_query(stored_query: RegisteredQuery) -> dict[str, list[str]] | None:
+    if stored_query is None or stored_query == "":
+        return None
+    if isinstance(stored_query, dict):
+        return {key: [str(value) for value in values] for key, values in stored_query.items()}
+    if isinstance(stored_query, str):
+        return parse_qs(stored_query) or None
+    raise ValueError("Unsupported stored query type")
+
+
+def _registered_uris(uris: Sequence[RegisteredURI]) -> list[RegisteredURITuple]:
+    """Normalize all supported client-record URI representations."""
+    result = []
+    for item in uris:
+        parsed = _parse_stored_uri(item)
+        if parsed is not None:
+            result.append(parsed)
+    return result
+
+
+def _stored_uri_tuples(uris: Sequence[RegisteredURI]) -> list[RegisteredURITuple]:
+    """Parse client records without changing their registered URI identity."""
+    result = []
+    for item in uris:
+        if isinstance(item, str):
+            part = urlparse(item)
+            query = parse_qs(part.query) or None
+            result.append((part._replace(query="").geturl(), query))
+        else:
+            if len(item) != 2:
+                continue
+            base, stored_query = item
+            if not isinstance(base, str):
+                continue
+            try:
+                query = _parse_stored_query(stored_query)
+            except ValueError:
+                continue
+            result.append((base, query))
+    return result
+
+
+def _query_matches(request_query: dict[str, list[str]], registered_query: dict[str, list[str]]) -> bool:
+    """Check that every registered query parameter is present in the request."""
+    for key, values in registered_query.items():
+        if key not in request_query:
+            return False
+        for value in values:
+            if value not in request_query[key]:
+                return False
+    return True
+
+
+def _uri_matches(uri: str, registered_uris: Sequence[RegisteredURI]) -> bool:
+    """Compare a request URI with URIs stored in a client record.
+
+    Non-loopback URIs use an exact scheme, host, port and path identity and
+    retain the established query-component rules. Loopback HTTP(S) URIs use
+    the RFC 8252 identity where equivalent loopback hosts and ephemeral ports
+    do not distinguish two URIs.
+    """
+    part = urlparse(uri)
+    if part.fragment:
+        return False
+
+    request_part = _normalize_loopback_uri(part)
+    request_base = request_part._replace(query="").geturl()
+    request_query = parse_qs(part.query) if part.query else None
+
+    for registered_base, registered_query in _registered_uris(registered_uris):
+        if request_base != registered_base:
+            continue
+        if not registered_query and not request_query:
+            return True
+        if not registered_query or not request_query:
+            continue
+        if _query_matches(request_query, registered_query):
+            return True
+
+    return False
 
 
 class InvalidRedirectURIError(Exception):
@@ -1441,7 +1581,7 @@ class Provider(AProvider):
                 continue
 
             val = []
-            for base, query_dict in args[param]:
+            for base, query_dict in _stored_uri_tuples(args[param]):
                 if query_dict:
                     query_string = urlencode([(key, v) for key in query_dict for v in query_dict[key]])
                     val.append("{}?{}".format(base, query_string))
@@ -1921,11 +2061,35 @@ class Provider(AProvider):
 
         try:
             accepted_urls = self.cdb[client_id]["post_logout_redirect_uris"]
-            if self._verify_url(redirect_uri, accepted_urls):
+            if _uri_matches(redirect_uri, accepted_urls):
                 return redirect_uri
         except Exception as exc:
             msg = "An error occurred while verifying redirect URI: %s"
             logger.debug(msg, exc)
+
+        return None
+
+    def _verify_redirect_uri(self, areq):
+        """Verify an authorization redirect URI against the client record.
+
+        Use the same URI identity and query rules as registration and
+        post-logout redirect verification, while accepting redirect URI
+        records written by older PyOIDC releases.
+        """
+        client_id = str(areq["client_id"])
+        try:
+            _cinfo = self.cdb[client_id]
+        except KeyError:
+            logger.info("Unknown client: %s", client_id)
+            raise UnknownClient(client_id) from None
+
+        redirect_uri = unquote(areq["redirect_uri"])
+        if urlparse(redirect_uri).fragment:
+            raise RedirectURIError("Faulty redirect_uri: {}".format(areq["redirect_uri"]))
+
+        if not _uri_matches(redirect_uri, _cinfo["redirect_uris"]):
+            logger.info("Registered redirect_uris: %s", sanitize(_cinfo))
+            raise RedirectURIError("Faulty redirect_uri: {}".format(areq["redirect_uri"]))
 
         return None
 
@@ -2192,8 +2356,9 @@ class Provider(AProvider):
                 else:
                     redirect_uri = self.post_logout_page
             else:
-                if len(_ruri) == 1:
-                    _base, _query = _ruri[0]
+                normalized_uris = _stored_uri_tuples(_ruri)
+                if len(normalized_uris) == 1:
+                    _base, _query = normalized_uris[0]
                     if _query:
                         query_string = urlencode([(key, v) for key in _query for v in _query[key]])
                         redirect_uri = "{}?{}".format(_base, query_string)

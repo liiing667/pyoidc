@@ -29,6 +29,10 @@ The format is based on the [KeepAChangeLog] project.
 - [#897]: End Session endpoint verifies id token hint against incorrect issuer
 - [#907]: LogoutToken accepts extra members in the `events` claim
 - [#910]: Reject relative (non-absolute), malformed and unsafe-scheme redirect_uris and post_logout_redirect_uris during client registration
+- [#910]: Use the same URI identity for authorization, post-logout redirects and client records. Loopback redirect
+  URIs follow RFC 8252 by treating loopback host aliases as equivalent and ignoring ephemeral ports, while all other
+  URI paths, including trailing slashes, continue to require exact matching; legacy string client records remain
+  supported.
 
 [#896]: https://github.com/CZ-NIC/pyoidc/pull/896
 [#897]: https://github.com/CZ-NIC/pyoidc/pull/897
