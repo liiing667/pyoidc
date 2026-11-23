@@ -968,7 +968,7 @@ class Provider:
                 )
                 return Unauthorized(error.to_json(), content="application/json")
             if "state" in areq:
-                if _info["state"] != areq["state"]:
+                if _info.get("state") != areq["state"]:
                     logger.error("State value mismatch")
                     error = TokenErrorResponse(
                         error="unauthorized_client",

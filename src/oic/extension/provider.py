@@ -506,13 +506,26 @@ class Provider(provider.Provider):
 
         :param code_verifier: The origin
         :param code_challenge: The transformed verifier used as challenge
-        :return:
+        :param code_challenge_method: The transformation used on the verifier, "plain" or one of CC_METHOD
+        :return: True if the verification succeeds, an error Response otherwise
         """
-        _h = CC_METHOD[code_challenge_method](code_verifier.encode("ascii")).digest()
-        _cc = b64e(_h)
-        if _cc.decode("ascii") != code_challenge:
-            logger.error("PCKE Code Challenge check failed")
-            err = TokenErrorResponse(error="invalid_request", error_description="PCKE check failed")
+        if code_challenge_method == "plain":
+            _cc = code_verifier
+        else:
+            try:
+                _method = CC_METHOD[code_challenge_method]
+            except KeyError:
+                logger.error("Unsupported PKCE code_challenge_method: %s", code_challenge_method)
+                err = TokenErrorResponse(
+                    error="invalid_request",
+                    error_description="Unsupported code_challenge_method",
+                )
+                return Response(err.to_json(), content="application/json", status_code=401)
+            _h = _method(code_verifier.encode("ascii")).digest()
+            _cc = b64e(_h).decode("ascii")
+        if _cc != code_challenge:
+            logger.error("PKCE Code Challenge check failed")
+            err = TokenErrorResponse(error="invalid_request", error_description="PKCE check failed")
             return Response(err.to_json(), content="application/json", status_code=401)
         return True
 
@@ -543,18 +556,24 @@ class Provider(provider.Provider):
             return Response(err.to_json(), content="application/json", status="401 Unauthorized")
 
         authzreq = json.loads(_info["authzreq"])
-        if "code_verifier" in areq:
+        if "code_challenge" in authzreq:
+            # The authorization request started a PKCE transaction, the token
+            # request has to complete it with the matching verifier - a
+            # missing verifier must not silently skip the check.
             try:
-                _method = authzreq["code_challenge_method"]
+                _verifier = areq["code_verifier"]
             except KeyError:
-                _method = "S256"
+                logger.error("Missing code_verifier for a PKCE protected grant")
+                err = TokenErrorResponse(error="invalid_grant", error_description="Missing code_verifier")
+                return Response(err.to_json(), content="application/json", status_code=401)
 
-            resp = self.verify_code_challenge(areq["code_verifier"], authzreq["code_challenge"], _method)
-            if resp:
+            _method = authzreq.get("code_challenge_method", "S256")
+            resp = self.verify_code_challenge(_verifier, authzreq["code_challenge"], _method)
+            if resp is not True:
                 return resp
 
         if "state" in areq:
-            if self.sdb[areq["code"]]["state"] != areq["state"]:
+            if _info.get("state") != areq["state"]:
                 logger.error("State value mismatch")
                 err = TokenErrorResponse(error="unauthorized_client")
                 return Unauthorized(err.to_json(), content="application/json")

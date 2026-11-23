@@ -1,8 +1,10 @@
+import hashlib
 import json
 import time
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from jwkest import b64e
 
 from oic import rndstr
 from oic.extension.client import Client
@@ -21,6 +23,7 @@ from oic.utils.authn.authn_context import AuthnBroker
 from oic.utils.authn.client import verify_client
 from oic.utils.authn.user import UserAuthnMethod
 from oic.utils.authz import Implicit
+from oic.utils.http_util import Response
 from oic.utils.keyio import KeyBundle, KeyJar
 from oic.utils.sdb import DefaultToken, SessionDB, lv_pack, lv_unpack
 from oic.utils.session_backend import DictSessionBackend
@@ -104,6 +107,12 @@ JWKS = {
 
 def _eq(l1, l2):
     return set(l1) == set(l2)
+
+
+def _pkce_challenge(verifier, method="S256"):
+    if method == "plain":
+        return verifier
+    return b64e(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii")
 
 
 def test_lv_pack_unpack():
@@ -514,3 +523,151 @@ class TestProvider:
 
         atr = TokenErrorResponse().deserialize(resp.message, "json")
         assert atr["error"] == "invalid_grant"
+
+    def _make_authz_session(self, authreq):
+        """Store an authorization session the way the authorization endpoint would."""
+        _sdb = self.provider.sdb
+        sid = _sdb.access_token.key(user="sub", areq=authreq)
+        access_grant = _sdb.token_factory["code"](sid=sid)
+        session = {
+            "oauth_state": "authz",
+            "sub": "sub",
+            "authzreq": authreq.to_json(),
+            "client_id": "client1",
+            "code": access_grant,
+            "code_used": False,
+            "redirect_uri": "http://example.com/authz",
+            "response_type": ["code"],
+        }
+        if "state" in authreq:
+            session["state"] = authreq["state"]
+        _sdb[sid] = session
+        return access_grant
+
+    def _token_request(self, access_grant, **extra):
+        areq = AccessTokenRequest(
+            code=access_grant,
+            redirect_uri="http://example.com/authz",
+            client_id="client1",
+            client_secret="hemlighet",
+            grant_type="authorization_code",
+            **extra,
+        )
+        return self.provider.token_endpoint(request=areq.to_urlencoded())
+
+    def _pkce_authz_session(self, state, verifier, method="S256"):
+        authreq = AuthorizationRequest(
+            state=state,
+            redirect_uri="http://example.com/authz",
+            client_id="client1",
+            code_challenge=_pkce_challenge(verifier, method),
+            code_challenge_method=method,
+        )
+        return self._make_authz_session(authreq)
+
+    def test_verify_code_challenge_plain(self):
+        verifier = rndstr(64)
+        assert self.provider.verify_code_challenge(verifier, verifier, "plain") is True
+        resp = self.provider.verify_code_challenge(verifier, "not-the-verifier", "plain")
+        assert isinstance(resp, Response)
+        assert resp.status_code == 401
+
+    def test_verify_code_challenge_unsupported_method(self):
+        resp = self.provider.verify_code_challenge("verifier", "challenge", "S999")
+        assert isinstance(resp, Response)
+        assert resp.status_code == 401
+        atr = TokenErrorResponse().deserialize(resp.message, "json")
+        assert atr["error"] == "invalid_request"
+
+    def test_token_endpoint_pkce_s256(self):
+        verifier = rndstr(64)
+        access_grant = self._pkce_authz_session("state-1", verifier, "S256")
+
+        resp = self._token_request(access_grant, code_verifier=verifier, state="state-1")
+        atr = AccessTokenResponse().deserialize(resp.message, "json")
+        assert "access_token" in atr
+
+    def test_token_endpoint_pkce_plain(self):
+        verifier = rndstr(64)
+        access_grant = self._pkce_authz_session("state-1", verifier, "plain")
+
+        resp = self._token_request(access_grant, code_verifier=verifier, state="state-1")
+        atr = AccessTokenResponse().deserialize(resp.message, "json")
+        assert "access_token" in atr
+
+    def test_token_endpoint_pkce_wrong_verifier(self):
+        verifier = rndstr(64)
+        access_grant = self._pkce_authz_session("state-1", verifier, "S256")
+
+        resp = self._token_request(access_grant, code_verifier=rndstr(64), state="state-1")
+        assert resp.status_code == 401
+        atr = TokenErrorResponse().deserialize(resp.message, "json")
+        assert atr["error"] == "invalid_request"
+
+    def test_token_endpoint_pkce_missing_verifier(self):
+        verifier = rndstr(64)
+        access_grant = self._pkce_authz_session("state-1", verifier, "S256")
+
+        # Omitting the verifier must not silently skip the PKCE check
+        resp = self._token_request(access_grant, state="state-1")
+        assert resp.status_code == 401
+        atr = TokenErrorResponse().deserialize(resp.message, "json")
+        assert atr["error"] == "invalid_grant"
+
+        # The failed attempt must not consume the code
+        resp = self._token_request(access_grant, code_verifier=verifier, state="state-1")
+        atr = AccessTokenResponse().deserialize(resp.message, "json")
+        assert "access_token" in atr
+
+    def test_token_endpoint_pkce_legacy_client(self):
+        # No code_challenge in the authorization request - no PKCE transaction
+        authreq = AuthorizationRequest(
+            state="state-1",
+            redirect_uri="http://example.com/authz",
+            client_id="client1",
+        )
+        access_grant = self._make_authz_session(authreq)
+
+        resp = self._token_request(access_grant, state="state-1")
+        atr = AccessTokenResponse().deserialize(resp.message, "json")
+        assert "access_token" in atr
+
+    def test_token_endpoint_pkce_cross_exchange(self):
+        verifier_a = rndstr(64)
+        verifier_b = rndstr(64)
+        grant_a = self._pkce_authz_session("state-a", verifier_a, "S256")
+        grant_b = self._pkce_authz_session("state-b", verifier_b, "S256")
+        assert grant_a != grant_b
+
+        # Code from transaction A with the verifier of transaction B
+        resp = self._token_request(grant_a, code_verifier=verifier_b, state="state-a")
+        assert resp.status_code == 401
+        atr = TokenErrorResponse().deserialize(resp.message, "json")
+        assert atr["error"] == "invalid_request"
+
+        # Code from transaction B with the verifier of transaction A
+        resp = self._token_request(grant_b, code_verifier=verifier_a, state="state-b")
+        assert resp.status_code == 401
+        atr = TokenErrorResponse().deserialize(resp.message, "json")
+        assert atr["error"] == "invalid_request"
+
+        # Code from transaction A with the state of transaction B
+        resp = self._token_request(grant_a, code_verifier=verifier_a, state="state-b")
+        assert resp.status_code == 401
+        atr = TokenErrorResponse().deserialize(resp.message, "json")
+        assert atr["error"] == "unauthorized_client"
+
+        # The failed attempts must not have consumed either code
+        resp = self._token_request(grant_a, code_verifier=verifier_a, state="state-a")
+        atr = AccessTokenResponse().deserialize(resp.message, "json")
+        assert "access_token" in atr
+
+        # A consumed code cannot be replayed, even with the right verifier and state
+        resp = self._token_request(grant_a, code_verifier=verifier_a, state="state-a")
+        atr = TokenErrorResponse().deserialize(resp.message, "json")
+        assert atr["error"] == "invalid_grant"
+
+        # Transaction B is unaffected by transaction A being consumed
+        resp = self._token_request(grant_b, code_verifier=verifier_b, state="state-b")
+        atr = AccessTokenResponse().deserialize(resp.message, "json")
+        assert "access_token" in atr

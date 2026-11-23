@@ -28,6 +28,11 @@ The format is based on the [KeepAChangeLog] project.
 
 - [#897]: End Session endpoint verifies id token hint against incorrect issuer
 - [#907]: LogoutToken accepts extra members in the `events` claim
+- PKCE (RFC 7636) is now enforced as a single transaction in the extension `Provider`: when the authorization
+  request carried a `code_challenge`, the token request must present the matching `code_verifier` - omitting it
+  no longer silently skips the check and now fails with `invalid_grant`. The `plain` method is supported,
+  unsupported methods are rejected, and the stored `state` is compared safely. Clients that do not use PKCE are
+  unaffected.
 - [#910]: Reject relative (non-absolute), malformed and unsafe-scheme redirect_uris and post_logout_redirect_uris during client registration
 
 [#896]: https://github.com/CZ-NIC/pyoidc/pull/896
