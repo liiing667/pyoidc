@@ -956,7 +956,13 @@ class Provider(AProvider):
         if "openid" in _info["scope"]:
             userinfo = self.userinfo_in_id_token_claims(_info)
             try:
-                _idtoken = self.sign_encrypt_id_token(_info, client_info, areq, user_info=userinfo)
+                _idtoken = self.sign_encrypt_id_token(
+                    _info,
+                    client_info,
+                    areq,
+                    access_token=_tinfo["access_token"],
+                    user_info=userinfo,
+                )
             except (JWEException, NoSuitableSigningKeys) as err:
                 logger.warning("%s", err)
                 return error_response("invalid_request", descr="Could not sign/encrypt id_token")
@@ -997,7 +1003,13 @@ class Provider(AProvider):
         if "openid" in _info["scope"] and "authn_event" in _info:
             userinfo = self.userinfo_in_id_token_claims(_info)
             try:
-                _idtoken = self.sign_encrypt_id_token(_info, client_info, areq, user_info=userinfo)
+                _idtoken = self.sign_encrypt_id_token(
+                    _info,
+                    client_info,
+                    areq,
+                    access_token=_info["access_token"],
+                    user_info=userinfo,
+                )
             except (JWEException, NoSuitableSigningKeys) as err:
                 logger.warning("%s", err)
                 return error_response("invalid_request", descr="Could not sign/encrypt id_token")

@@ -50,6 +50,7 @@ from oic.oic.message import (
     TokenErrorResponse,
     UserInfoErrorResponse,
     UserInfoRequest,
+    id_token_hash_alg,
 )
 from oic.utils import time_util
 from oic.utils.http_util import Response
@@ -420,6 +421,8 @@ class Client(oauth2.Client):
                 _scope = None
 
             for token in grant.tokens:
+                if token.replaced:
+                    continue
                 if token.scope and _scope:
                     flag = True
                     for item in _scope:
@@ -430,6 +433,13 @@ class Client(oauth2.Client):
                         break
                 if token.id_token:
                     return token.id_token.jwt
+
+            # The current token may not carry an ID Token itself.  Only use an
+            # older one when Grant says it is bound to the current response.
+            if _scope is None:
+                idt = grant.get_id_token()
+                if idt is not None:
+                    return idt.jwt
 
         return None
 
@@ -1780,13 +1790,13 @@ class Server(oauth2.Server):
             except KeyError:
                 pass
 
-        halg = "HS{}".format(alg[-3:])
+        halg = id_token_hash_alg(alg)
 
         if extra_claims is not None:
             _args.update(extra_claims)
-        if code:
+        if code and halg is not None:
             _args["c_hash"] = jws.left_hash(code.encode("utf-8"), halg)
-        if access_token:
+        if access_token and halg is not None:
             _args["at_hash"] = jws.left_hash(access_token.encode("utf-8"), halg)
 
         idt = IdToken(

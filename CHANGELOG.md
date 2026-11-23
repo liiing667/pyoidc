@@ -29,6 +29,9 @@ The format is based on the [KeepAChangeLog] project.
 - [#897]: End Session endpoint verifies id token hint against incorrect issuer
 - [#907]: LogoutToken accepts extra members in the `events` claim
 - [#910]: Reject relative (non-absolute), malformed and unsafe-scheme redirect_uris and post_logout_redirect_uris during client registration
+- Bind ID Token claims to the access token/code carried by the same response, and keep the
+  response-local ID Token/token pair when a grant is updated. A missing hash no longer allows
+  signed claims from one response to be combined with a token from another response.
 
 [#896]: https://github.com/CZ-NIC/pyoidc/pull/896
 [#897]: https://github.com/CZ-NIC/pyoidc/pull/897

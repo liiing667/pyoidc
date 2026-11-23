@@ -264,7 +264,56 @@ def check_char_set(string, allowed):
 TOKEN_VERIFY_ARGS = ["key", "keyjar", "algs", "sender"]
 
 
-def verify_id_token(instance, check_hash=False, **kwargs):  # noqa: C901 # was 18
+# OIDC Core defines at_hash/c_hash as the left-most half of the hash of the
+# token/code, using the hash algorithm of the ID Token's JWS alg.  Keep an
+# explicit mapping instead of deriving it from the last three characters of
+# the algorithm name: that works for HS256/RS256/ES256/PS256 style names but
+# not for algorithms such as EdDSA or ES256K.
+ID_TOKEN_HASH_ALG = {
+    "HS256": "HS256",
+    "HS384": "HS384",
+    "HS512": "HS512",
+    "RS256": "HS256",
+    "RS384": "HS384",
+    "RS512": "HS512",
+    "ES256": "HS256",
+    "ES384": "HS384",
+    "ES512": "HS512",
+    "ES256K": "HS256",
+    "PS256": "HS256",
+    "PS384": "HS384",
+    "PS512": "HS512",
+    # Ed25519 (and Ed448) are defined to use SHA-512/SHAKE256 respectively.
+    # The OIDC hash claim only keeps the left half, which for EdDSA is the
+    # SHA-512 half used by the Ed25519 signature.
+    "EdDSA": "HS512",
+}
+
+
+def id_token_hash_alg(alg):
+    """Return the hash algorithm used for at_hash/c_hash for a JWS ``alg``.
+
+    ``None`` is returned for the unsecured ``none`` algorithm because there is
+    no signature algorithm whose hash function could be used.  Unknown
+    algorithms fall back to the historical behaviour of deriving the hash
+    size from the algorithm name, but only for the well-known HMAC/RSA/EC/PS
+    family names.
+    """
+    if alg == "none":
+        return None
+
+    try:
+        return ID_TOKEN_HASH_ALG[alg]
+    except KeyError:
+        pass
+
+    if isinstance(alg, str) and alg[:2] in ("HS", "RS", "ES", "PS") and alg[-3:] in ("256", "384", "512"):
+        return "HS" + alg[-3:]
+
+    raise ValueError("Unsupported signing algorithm for ID Token hash: {}".format(alg))
+
+
+def verify_id_token(instance, check_hash=None, **kwargs):  # noqa: C901 # was 18
     # Try to decode the JWT, checks the signature
     args = {}
     for arg in TOKEN_VERIFY_ARGS:
@@ -300,25 +349,35 @@ def verify_id_token(instance, check_hash=False, **kwargs):  # noqa: C901 # was 1
     if not idt.verify(**kwargs):
         raise VerificationError("Could not verify id_token", idt)
 
-    if check_hash:
-        _alg = idt.jws_header["alg"]
-        if _alg != "none":
-            hfunc = "HS" + _alg[-3:]
-        else:
-            # This is allowed only for `code` and it needs to be checked by a Client
-            hfunc = None
+    # A hash claim that is present must always match the token/code carried by
+    # this very response.  `check_hash=True` additionally makes a missing
+    # claim an error; `check_hash=False` is the explicit old-client opt-out.
+    # Keeping the check active by default prevents a token from being paired
+    # with signed claims from a different response when the claim is present
+    # but wrong.
+    #
+    # `none` is allowed only for `code` and it needs to be checked by a
+    # Client.  There is no signature hash function to bind a token with in
+    # that case.
+    require_hash = check_hash is True
+    verify_present_hash = check_hash is not False
+    check_access_hash = "access_token" in instance and (require_hash or (verify_present_hash and "at_hash" in idt))
+    check_code_hash = "code" in instance and (require_hash or (verify_present_hash and "c_hash" in idt))
+    hfunc = id_token_hash_alg(idt.jws_header["alg"]) if (check_access_hash or check_code_hash) else None
 
-        if "access_token" in instance and hfunc is not None:
-            if "at_hash" not in idt:
-                raise MissingRequiredAttribute("Missing at_hash property", idt)
+    if check_access_hash and hfunc is not None:
+        if "at_hash" in idt:
             if idt["at_hash"] != jws.left_hash(instance["access_token"], hfunc):
                 raise AtHashError("Failed to verify access_token hash", idt)
+        elif require_hash:
+            raise MissingRequiredAttribute("Missing at_hash property", idt)
 
-        if "code" in instance and hfunc is not None:
-            if "c_hash" not in idt:
-                raise MissingRequiredAttribute("Missing c_hash property", idt)
+    if check_code_hash and hfunc is not None:
+        if "c_hash" in idt:
             if idt["c_hash"] != jws.left_hash(instance["code"], hfunc):
                 raise CHashError("Failed to verify code hash", idt)
+        elif require_hash:
+            raise MissingRequiredAttribute("Missing c_hash property", idt)
 
     return idt
 
@@ -339,6 +398,12 @@ class AccessTokenResponse(message.AccessTokenResponse):
     c_param.update({"id_token": SINGLE_OPTIONAL_STRING})
 
     def verify(self, **kwargs):
+        # Keep accepting old token responses that do not carry at_hash.  A
+        # hash that is present is still checked by verify_id_token.  The
+        # client-side grant keeps the ID Token and the token from the same
+        # response together, so a missing hash cannot make it reuse an older
+        # ID Token with a token from another response.
+        check_hash = kwargs.pop("check_hash", None)
         super().verify(**kwargs)
         if "id_token" in self:
             # The ID token JWT needs to be passed in the access token response
@@ -346,7 +411,7 @@ class AccessTokenResponse(message.AccessTokenResponse):
             # https://openid.net/specs/openid-connect-rpinitiated-1_0.html#RPLogout
             self["id_token_jwt"] = self["id_token"]
             # replace the JWT with the verified IdToken instance
-            self["id_token"] = verify_id_token(self, **kwargs)
+            self["id_token"] = verify_id_token(self, check_hash=check_hash, **kwargs)
 
         return True
 
@@ -368,6 +433,7 @@ class AuthorizationResponse(message.AuthorizationResponse, message.AccessTokenRe
     )
 
     def verify(self, **kwargs):
+        check_hash = kwargs.pop("check_hash", True)
         super().verify(**kwargs)
 
         if "aud" in self:
@@ -377,7 +443,7 @@ class AuthorizationResponse(message.AuthorizationResponse, message.AccessTokenRe
                     return False
 
         if "id_token" in self:
-            self["id_token"] = verify_id_token(self, check_hash=True, **kwargs)
+            self["id_token"] = verify_id_token(self, check_hash=check_hash, **kwargs)
 
         if "access_token" in self:
             if "token_type" not in self:

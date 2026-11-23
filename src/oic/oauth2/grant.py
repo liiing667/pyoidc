@@ -1,9 +1,55 @@
 import time
 
+from jwkest import jws
+
 from oic.oauth2.message import AccessTokenResponse, AuthorizationResponse
 from oic.utils.time_util import utc_time_sans_frac
 
 __author__ = "roland"
+
+
+def _id_token_hash_alg(alg):
+    """Return the hash functor name used by at_hash/c_hash for ``alg``."""
+    if alg == "none":
+        return None
+    if alg == "EdDSA":
+        return "HS512"
+    if alg == "ES256K":
+        return "HS256"
+    if isinstance(alg, str) and alg[:2] in ("HS", "RS", "ES", "PS") and alg[-3:] in ("256", "384", "512"):
+        return "HS" + alg[-3:]
+    return None
+
+
+def _id_token_binds(id_token, tokens, code=None):
+    """Check whether an ID Token is bound to the given token/code.
+
+    This is only used when the response that carried the ID Token did not
+    carry the token itself.  Without a matching at_hash/c_hash there is no
+    evidence that the signed claims and the token belong together.
+    """
+    try:
+        hfunc = _id_token_hash_alg(id_token.jws_header["alg"])
+    except (AttributeError, KeyError, TypeError):
+        # Be conservative for plain mappings that predate the IdToken object:
+        # at_hash/c_hash still have to match a real token/code below.
+        hfunc = "HS256"
+
+    if hfunc is None:
+        return False
+
+    at_hash = id_token.get("at_hash")
+    if at_hash:
+        for token in tokens:
+            access_token = getattr(token, "access_token", None)
+            if access_token and at_hash == jws.left_hash(access_token, hfunc):
+                return True
+
+    c_hash = id_token.get("c_hash")
+    if code and c_hash and c_hash == jws.left_hash(code, hfunc):
+        return True
+
+    return False
 
 
 class Token:
@@ -139,19 +185,45 @@ class Grant:
             pass
 
     def get_id_token(self):
-        if self.id_token:
-            if self.id_token["exp"] >= time.time():
-                return self.id_token
-        else:
+        now = time.time()
+
+        if self.id_token and self.id_token.get("exp", 0) >= now:
+            return self.id_token
+
+        active = [tok for tok in self.tokens if not tok.replaced and tok.is_valid()]
+
+        # Prefer the ID Token that arrived in the same response as the current
+        # token.  This keeps the signed claims, the hash and the token that is
+        # actually used by the client together.
+        for tok in active:
+            id_token = getattr(tok, "id_token", None)
+            if id_token and id_token.get("exp", 0) >= now:
+                return id_token
+
+        # No token is currently usable.  The most recent response is still a
+        # self-contained pair, so its own ID Token may be used (for example as
+        # an id_token_hint), but an ID Token from an earlier response must not
+        # be borrowed for it.
+        if not active and self.tokens:
+            id_token = getattr(self.tokens[-1], "id_token", None)
+            if id_token and id_token.get("exp", 0) >= now:
+                return id_token
+
+        # A pure ID Token response has no access token to pair with.
+        if not any(getattr(tok, "access_token", None) for tok in self.tokens):
             for tok in self.tokens:
-                try:
-                    _idt = tok.id_token
-                except AttributeError:
-                    pass
-                else:
-                    if _idt:
-                        if _idt["exp"] >= time.time():
-                            return _idt
+                id_token = getattr(tok, "id_token", None)
+                if id_token and id_token.get("exp", 0) >= now:
+                    return id_token
+
+        # The token response may not contain a fresh ID Token.  Reuse an
+        # earlier one only if its hash proves that it belongs to the current
+        # token or the code stored in this grant.
+        for tok in self.tokens:
+            id_token = getattr(tok, "id_token", None)
+            if id_token and id_token.get("exp", 0) >= now and _id_token_binds(id_token, active, self.code):
+                return id_token
+
         return None
 
     def join(self, grant):
