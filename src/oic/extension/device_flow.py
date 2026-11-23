@@ -5,6 +5,7 @@ from oic.oauth2.message import (
     SINGLE_OPTIONAL_STRING,
     SINGLE_REQUIRED_STRING,
     AccessTokenResponse,
+    ErrorResponse,
     Message,
 )
 from oic.utils.time_util import time_sans_frac
@@ -36,43 +37,106 @@ class TokenRequest(Message):
     }
 
 
+class DeviceState:
+    """Complete state of one device authorization session.
+
+    Everything known about a device code lives here: which client it was
+    issued to, the user code it maps to, when it expires, the polling
+    interval, when it was last polled and whether the user has confirmed
+    or denied the authorization.
+    """
+
+    def __init__(self, device_code, user_code, client_id, expires_at, interval):
+        self.device_code = device_code
+        self.user_code = user_code
+        self.client_id = client_id
+        self.expires_at = expires_at
+        self.interval = interval
+        self.last_poll_at = 0  # 0 means "never polled"
+        self.authorized = False
+        self.denied = False
+
+    def is_expired(self, now=None):
+        if now is None:
+            now = time_sans_frac()
+        return now >= self.expires_at
+
+
 class DeviceFlowServer(SingleService):
-    def __init__(self, host):
+    def __init__(self, host, verification_uri=""):
         SingleService.__init__(self, host)
         self.host = host
-        # map between device_code and user_code
-        self.client_id2device: dict[str, str] = {}
-        self.device2user: dict[str, str] = {}
-        self.user_auth: dict[str, bool] = {}
-        self.device_code_expire_at: dict[str, int] = {}
+        # device_code -> DeviceState, the single source of truth
+        self.device_states: dict[str, DeviceState] = {}
+        # user_code -> device_code, used when the user confirms/denies
+        self.user_code2device: dict[str, str] = {}
         self.device_code_life_time = 900  # 15 minutes
+        self.interval = 5  # minimum seconds between polls
+        self.verification_uri = verification_uri
 
     def device_endpoint(self, request, authn=None):
         _req = AuthorizationRequest(**request)
         device_code = rndstr(10)
         user_code = rndstr(6)
 
-        self.device2user[device_code] = user_code
-        self.user_auth[user_code] = False
-        self.client_id2device[_req["client_id"]] = device_code
-        self.device_code_expire_at[device_code] = time_sans_frac() + self.device_code_life_time
+        state = DeviceState(
+            device_code=device_code,
+            user_code=user_code,
+            client_id=_req["client_id"],
+            expires_at=time_sans_frac() + self.device_code_life_time,
+            interval=self.interval,
+        )
+        self.device_states[device_code] = state
+        self.user_code2device[user_code] = device_code
+
+        return AuthorizationResponse(
+            device_code=device_code,
+            user_code=user_code,
+            verification_uri=self.verification_uri,
+            expires_in=self.device_code_life_time,
+            interval=self.interval,
+        )
 
     def token_endpoint(self, request, authn=None):
         _req = TokenRequest(**request)
         _dc = _req["device_code"]
 
-        if time_sans_frac() > self.device_code_expire_at[_dc]:
-            return self.host.error_code(error="expired_token")
+        state = self.device_states.get(_dc)
+        if state is None:
+            return ErrorResponse(error="invalid_grant", error_description="Unknown device_code")
 
-        _uc = self.device2user[_dc]
+        if state.is_expired():
+            return ErrorResponse(error="expired_token")
 
-        if self.user_auth[_uc]:  # User is authenticated
-            pass
+        # The device code is bound to the client it was issued to.
+        if state.client_id != _req["client_id"]:
+            return ErrorResponse(error="invalid_grant", error_description="device_code was issued to another client")
+
+        now = time_sans_frac()
+        if state.last_poll_at and now - state.last_poll_at < state.interval:
+            # RFC 8628 section 3.5: polling too fast, increase the interval.
+            state.interval += 5
+            return ErrorResponse(error="slow_down")
+        state.last_poll_at = now
+
+        if state.denied:
+            return ErrorResponse(error="access_denied")
+
+        if not state.authorized:
+            return ErrorResponse(error="authorization_pending")
+
+        # User has confirmed; issue a token and consume the device code.
+        del self.device_states[_dc]
+        self.user_code2device.pop(state.user_code, None)
+        return AccessTokenResponse(access_token=rndstr(32), token_type="Bearer", expires_in=3600)
+
+    def device_auth(self, user_code, accept=True):
+        device_code = self.user_code2device[user_code]
+        state = self.device_states[device_code]
+        if accept:
+            state.authorized = True
         else:
-            return self.host.error_code(error="authorization_pending")
-
-    def device_auth(self, user_code):
-        self.user_auth[user_code] = True
+            state.denied = True
 
 
 class DeviceFlowClient(SingleClient):
@@ -80,7 +144,7 @@ class DeviceFlowClient(SingleClient):
         SingleClient.__init__(self, host)
         self.requests = {
             "authorization": self.authorization_request,
-            "token": self.authorization_request,
+            "token": self.token_request,
         }
 
     def authorization_request(self, scope=""):
